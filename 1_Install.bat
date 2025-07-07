@@ -12,6 +12,9 @@ echo "Installing. Please Wait...."
 
 pip --disable-pip-version-check install --no-clean -r requirements.txt
 
+ python -c "import gradio_interface; gradio_interface.load_model_if_needed('Zyphra/Zonos-v0.1-hybrid')"
+ python -c "import gradio_interface; gradio_interface.load_model_if_needed('Zyphra/Zonos-v0.1-transformer')"
+ 
 call ".env_win\Scripts\deactivate.bat"
 
 echo(
