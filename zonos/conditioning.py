@@ -66,6 +66,18 @@ from sudachipy import Dictionary, SplitMode
 
 if sys.platform == "darwin":
     os.environ["PHONEMIZER_ESPEAK_LIBRARY"] = "/opt/homebrew/lib/libespeak-ng.dylib"
+elif sys.platform == "win32":
+    # Use Windows-style env var and expand it
+    path1_with_env = r"%ProgramFiles%\\eSpeak NG"
+    path2_with_env=r'%ProgramFiles%\\eSpeak NG\\libespeak-ng.dll'
+
+    file_path1 = os.path.expandvars(path1_with_env)
+    file_path2 = os.path.expandvars(path2_with_env)
+
+    os.environ['PHONEMIZER_ESPEAK_PATH'] = file_path1
+    os.environ['PHONEMIZER_ESPEAK_LIBRARY'] = file_path2
+
+
 
 # --- Number normalization code from https://github.com/daniilrobnikov/vits2/blob/main/text/normalize_numbers.py ---
 
