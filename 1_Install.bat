@@ -10,7 +10,7 @@ winget install --id=eSpeak-NG.eSpeak-NG  -e --silent --accept-package-agreements
 
 
 echo (
-py -3.13 -m venv .env_win
+py -3.12 -m venv .env_win
 call ".env_win/scripts/activate.bat"
 
 echo "Installing. Please Wait...."
