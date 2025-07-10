@@ -12,3 +12,5 @@ wheels/
 # Misc.
 .ipynb_checkpoints/
 /.env_win
+/.idea
+/models

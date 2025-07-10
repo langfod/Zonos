@@ -697,7 +697,7 @@ import argparse
 import sys
 parser = argparse.ArgumentParser()
 parser.add_argument('--share', action='store_true')
-parser.add_argument("--server", type=str, default='0.0.0.0')
+parser.add_argument("--server", type=str, default='localhost')
 parser.add_argument("--port", type=int, required=False)
 parser.add_argument("--inbrowser", action='store_true')
 parser.add_argument("--output_dir", type=str, default='./outputs')
@@ -882,9 +882,39 @@ def generate_audio(
     seed,
     randomize_seed,
     unconditional_keys,
-    disable_torch_compile=False,
+    disable_torch_compile=disable_torch_compile_default,
     progress=gr.Progress(),
 ):
+    print(    model_choice,
+    text,
+    language,
+    speaker_audio,
+    prefix_audio,
+    e1,
+    e2,
+    e3,
+    e4,
+    e5,
+    e6,
+    e7,
+    e8,
+    vq_single,
+    fmax,
+    pitch_std,
+    speaking_rate,
+    dnsmos_ovrl,
+    speaker_noised,
+    cfg_scale,
+    top_p,
+    top_k,
+    min_p,
+    linear,
+    confidence,
+    quadratic,
+    seed,
+    randomize_seed,
+    unconditional_keys,
+    disable_torch_compile,)
     """
     Generates audio based on the provided UI parameters.
     We do NOT use language_id or ctc_loss even if the model has them.
@@ -977,8 +1007,6 @@ def generate_audio(
 
 def build_interface():
     supported_models = []
-    #if "transformer" in ZonosBackbone.supported_architectures:
-    #    supported_models.append(AI_MODEL_DIR_TF)
 
     if "hybrid" in ZonosBackbone.supported_architectures:
         supported_models.append(AI_MODEL_DIR_HY)
@@ -987,6 +1015,9 @@ def build_interface():
             "| The current ZonosBackbone does not support the hybrid architecture, meaning only the transformer model will be available in the model selector.\n"
             "| This probably means the mamba-ssm library has not been installed."
         )
+
+    if "transformer" in ZonosBackbone.supported_architectures:
+        supported_models.append(AI_MODEL_DIR_TF)
 
     with gr.Blocks() as demo:
         with gr.Row():
@@ -1115,7 +1146,7 @@ def build_interface():
                 dnsmos_slider,
                 speaker_noised_checkbox,
                 unconditional_keys,
-                
+                disable_torch_compile,  
             ],
         )
 
@@ -1179,7 +1210,7 @@ def build_interface():
                 seed_number,
                 randomize_seed_toggle,
                 unconditional_keys,
-               
+               disable_torch_compile,
             ],
             outputs=[output_audio, seed_number],
         )
@@ -1188,6 +1219,10 @@ def build_interface():
 
 
 if __name__ == "__main__":
+    
+    gr.set_static_paths(paths=["assets/"])
+    demo = build_interface()
+    load_model_if_needed("Zyphra/Zonos-v0.1-hybrid")
     demo = build_interface()
     demo.launch(
         server_name=args.server,

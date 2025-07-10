@@ -1,46 +1,46 @@
 #Core-Zonos
 #PYTORCH*********************************************************************
 
---extra-index-url=https://download.pytorch.org/whl/nightly/cpu ; sys_platform  == 'darwin'
 --extra-index-url=https://download.pytorch.org/whl/cu128 ; sys_platform  != 'darwin'
-torch==2.7.0
+torch>=2.7.1
 torchaudio
 
 
 
 #TRITON*************************************
 https://github.com/woct0rdho/triton-windows/releases/download/empty/triton-3.3.0-py3-none-any.whl ; sys_platform == 'win32' #egg:3.3.0
-triton-windows==3.3.0.post19 ; sys_platform == 'win32' # tw
-https://github.com/loscrossos/lib_triton/releases/download/v3.3.0%2Bgit766f7fa9/triton-3.3.0+gitaaa9932acu129torch2.7.0-cp312-cp312-linux_x86_64.whl ; sys_platform == 'linux' #egg:3.3.0
+triton-windows; sys_platform == 'win32' # tw
 
 
 #FLASH ATTENTION****************************
-https://github.com/loscrossos/lib_flashattention/releases/download/v2.7.4.post1_crossos00/flash_attn-2.7.4.post1+cu129torch2.7.0-cp312-cp312-linux_x86_64.whl ; sys_platform == 'linux' #egg:v2.7.4.post1
-https://github.com/loscrossos/lib_flashattention/releases/download/v2.7.4.post1_crossos00/flash_attn-2.7.4.post1+cu129torch2.7.0-cp312-cp312-win_amd64.whl ; sys_platform == 'win32' #egg:v2.7.4.post1
+https://github.com/loscrossos/lib_flashattention/releases/download/v2.8.0/flash_attn-2.8.0+cu129torch2.7.1-cp312-cp312-linux_x86_64.whl ; sys_platform == 'linux' #egg:v2.7.4.post1
+https://github.com/loscrossos/lib_flashattention/releases/download/v2.8.0/flash_attn-2.8.0+cu129torch2.7.1-cp312-cp312-win_amd64.whl ; sys_platform == 'win32' #egg:v2.7.4.post1
+
 
 
 
 
 #causal conv1d******************************
-https://github.com/loscrossos/lib_causal-conv1d/releases/download/v1.5.0.post8_crossos00/causal_conv1d-1.5.0.post8+cu129torch2.7.0-cp312-cp312-linux_x86_64.whl ; sys_platform == 'linux' #egg:v1.5.0.post8
-https://github.com/loscrossos/lib_causal-conv1d/releases/download/v1.5.0.post8_crossos00/causal_conv1d-1.5.0.post8+cu129torch2.7.0-cp312-cp312-win_amd64.whl  ; sys_platform == 'win32' #egg:v1.5.0.post8
+https://github.com/loscrossos/lib_causal-conv1d/releases/download/v1.5.0.post8_crossos00/causal_conv1d-1.5.0.post8+cu129torch2.7.1-cp312-cp312-win_amd64.whl  ; sys_platform == 'win32' #egg:v1.5.0.post8
 
 
 
 #mamba**************************************
-https://github.com/loscrossos/lib_mamba/releases/download/v2.2.4_crossos00/mamba_ssm-2.2.4+cu129torch2.7.0-cp312-cp312-linux_x86_64.whl ; sys_platform == 'linux' #egg:v2.2.4
-https://github.com/loscrossos/lib_mamba/releases/download/v2.2.4_crossos00/mamba_ssm-2.2.4+cu129torch2.7.0-cp312-cp312-win_amd64.whl ; sys_platform == 'win32' #egg:v2.2.4
+https://github.com/loscrossos/lib_mamba/releases/download/v2.2.4_crossos00/mamba_ssm-2.2.4+cu129torch2.7.1-cp312-cp312-win_amd64.whl ; sys_platform == 'win32' #egg:v2.2.4
 
 
 
-#common
+
 packaging
 setuptools
-wheel
+
+
+
 inflect>=7.5.0
 kanjize>=1.5.0
 numpy>=2.2.2
-phonemizer>=3.3.0
+#phonemizer>=3.3.0
+phonemizer-fork>=3.3.2
 sudachidict-full>=20241021
 sudachipy>=0.6.10
 transformers>=4.48.1

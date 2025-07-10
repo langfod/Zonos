@@ -1,11 +1,16 @@
 @echo off
 echo "Please have Python 3.12"
 echo "https://www.python.org/ftp/python/3.12.10/python-3.12.10-amd64.exe"
+echo(
 
+echo(
+echo "Checking for eSpeak NG" 
+echo(
 winget install --id=eSpeak-NG.eSpeak-NG  -e --silent --accept-package-agreements --accept-source-agreements
 
 
-py -3.12 -m venv .env_win
+echo (
+py -3.13 -m venv .env_win
 call ".env_win/scripts/activate.bat"
 
 echo "Installing. Please Wait...."

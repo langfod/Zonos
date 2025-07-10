@@ -1,0 +1,64 @@
+
+Windows with Python *****3.12*****
+https://www.python.org/ftp/python/3.12.10/python-3.12.10-amd64.exe
+
+Espeak-NG:
+winget install --id=eSpeak-NG.eSpeak-NG  -e --silent --accept-package-agreements --accept-source-agreements
+
+
+CUDA ToolKit
+https://developer.nvidia.com/cuda-downloads?target_os=Windows&target_arch=x86_64&target_version=11&target_type=exe_local
+
+Possibly Visual Studio (for some compiler stuff)
+https://visualstudio.microsoft.com/thank-you-downloading-visual-studio/?sku=Community&channel=Release&version=VS2022&source=VSLandingPage&passive=false&cid=2030
+
+
+
+
+
+Environment:
+
+pip install pyinstaller
+py -3.12 -m venv .venv_win
+
+.venv_win\scripts\activate
+
+python -m pip install pip --upgrade
+pip install -r requirements.txt
+
+
+test using:
+python appzonos.py
+and goto http://localhost:7860
+
+To build the executable:
+
+rmdir /s /q dist build
+pyinstall appzonos.spec
+
+
+
+
+Usually in another cmd window I would either:
+cd dist\appzonos
+appzonos.exe
+
+Or just use: test.bat 
+then goto http://localhost:7860
+
+note: can copy the files in models\hf_download\hub into dist_files_models\models\hf_download\hub to save a download for subsequent tests as the test.bat file will then copy these.
+
+
+the appzonos.spec file now probably has a lot of entries that are not needed and should be cleaned up; but is also currently missing something still.
+
+
+
+
+
+The appzonos.py file was originally from:
+https://github.com/loscrossos/core_zonos
+
+
+https://github.com/sdbds/Zonos-for-windows
+
+https://github.com/Zyphra/Zonos
