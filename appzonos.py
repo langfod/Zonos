@@ -245,13 +245,13 @@ def update_model_paths_file(
     for key, value in paths.items():
         varname = model_to_varname(key, PREFIX_PATH)
         if varname not in existing:
-            print(f"{LOG_PREFIX}: Adding path rquirement to config: {key}")
+            print(f"{LOG_PREFIX}: Adding path requirement to config: {key}")
             new_lines.append(f"{varname} = {value}")
     
     # Process params
     for key, value in params.items():
         if key not in existing:
-            print(f"{LOG_PREFIX}: Adding Parameter rquirement to config: {key}")
+            print(f"{LOG_PREFIX}: Adding Parameter requirement to config: {key}")
             new_lines.append(f"{key} = {value}")
     
     # Append new lines if any
@@ -260,8 +260,7 @@ def update_model_paths_file(
             f.write("\n" + "\n".join(new_lines) + "\n")
 
 def parse_model_paths_file(file_path: str , dotenv_needed_models, dotenv_needed_paths ) -> tuple[
-    Set[str], Dict[str, str], Dict[str, Union[bool, int, float, str]]
-]:
+    dict[Any, Any], dict[Any, Any], dict[Any, Any], dict[Any, Any]]:
     """Reads config file and returns loaded variables"""
     loaded_models = {}
     loaded_paths = {}
@@ -500,10 +499,10 @@ def generate_troubleshooting_report(in_model_config_file=None):
     report = []
     report.append(f"{divider}")
     report.append(f"TROUBLESHOOTING REPORT - Generated on {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    
+
     # 1. Hardware Information
     report.append("HARDWARE INFORMATION")
-    
+
     # CPU Info
     report.append("\nCPU:")
     report.append(f"  Model: {platform.processor()}")
@@ -775,6 +774,7 @@ CURRENT_MODEL = None
 SPEAKER_EMBEDDING = None
 SPEAKER_AUDIO_PATH = None
 
+SPEAKER_AUDIO_PATH_DICT = {}
 
 def load_model_if_needed(model_choice: str):
     global CURRENT_MODEL_TYPE, CURRENT_MODEL
@@ -882,7 +882,7 @@ def generate_audio(
     seed,
     randomize_seed,
     unconditional_keys,
-    disable_torch_compile=disable_torch_compile_default,
+    disable_torch_compile= disable_torch_compile_default,
     progress=gr.Progress(),
 ):
     print(    model_choice,
@@ -914,7 +914,7 @@ def generate_audio(
     seed,
     randomize_seed,
     unconditional_keys,
-    disable_torch_compile,)
+    )
     """
     Generates audio based on the provided UI parameters.
     We do NOT use language_id or ctc_loss even if the model has them.
@@ -937,19 +937,27 @@ def generate_audio(
     max_new_tokens = 86 * 30
 
     # This is a bit ew, but works for now.
-    global SPEAKER_AUDIO_PATH, SPEAKER_EMBEDDING
+    global SPEAKER_AUDIO_PATH, SPEAKER_AUDIO_PATH_DICT, SPEAKER_EMBEDDING
 
     if randomize_seed:
         seed = torch.randint(0, 2**32 - 1, (1,)).item()
     torch.manual_seed(seed)
 
     if speaker_audio is not None and "speaker" not in unconditional_keys:
-        if speaker_audio != SPEAKER_AUDIO_PATH:
+        if speaker_audio not in SPEAKER_AUDIO_PATH_DICT:
             print("Recomputed speaker embedding")
             wav, sr = torchaudio.load(speaker_audio)
             SPEAKER_EMBEDDING = selected_model.make_speaker_embedding(wav, sr)
             SPEAKER_EMBEDDING = SPEAKER_EMBEDDING.to(device, dtype=torch.bfloat16)
             SPEAKER_AUDIO_PATH = speaker_audio
+            SPEAKER_AUDIO_PATH_DICT[speaker_audio] = SPEAKER_EMBEDDING
+        else:
+            print(f"SPEAKER_AUDIO_PATH is {SPEAKER_AUDIO_PATH}")
+            print(f"speaker_audio  is {speaker_audio}")
+            if speaker_audio != SPEAKER_AUDIO_PATH:
+                print("Reused cached speaker embedding")
+                SPEAKER_AUDIO_PATH = speaker_audio
+                SPEAKER_EMBEDDING = SPEAKER_AUDIO_PATH_DICT[speaker_audio]
 
     audio_prefix_codes = None
     if prefix_audio is not None:
@@ -1210,7 +1218,6 @@ def build_interface():
                 seed_number,
                 randomize_seed_toggle,
                 unconditional_keys,
-               disable_torch_compile,
             ],
             outputs=[output_audio, seed_number],
         )
@@ -1221,7 +1228,6 @@ def build_interface():
 if __name__ == "__main__":
     
     gr.set_static_paths(paths=["assets/"])
-    demo = build_interface()
     load_model_if_needed("Zyphra/Zonos-v0.1-hybrid")
     demo = build_interface()
     demo.launch(
