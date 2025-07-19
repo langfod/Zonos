@@ -30,9 +30,6 @@ if %errorlevel% neq 0 (
     goto :EOF
 )
 
- python -c "import gradio_interface; gradio_interface.load_model_if_needed('Zyphra/Zonos-v0.1-hybrid')"
- python -c "import gradio_interface; gradio_interface.load_model_if_needed('Zyphra/Zonos-v0.1-transformer')"
- 
 call ".env_win\Scripts\deactivate.bat"
 
 echo(
