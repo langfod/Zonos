@@ -1225,6 +1225,9 @@ def build_interface():
     return demo
 
 
+
+
+
 if __name__ == "__main__":
     
     gr.set_static_paths(paths=["assets/"])

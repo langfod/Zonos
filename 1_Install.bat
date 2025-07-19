@@ -9,13 +9,26 @@ echo(
 winget install --id=eSpeak-NG.eSpeak-NG  -e --silent --accept-package-agreements --accept-source-agreements
 
 
-echo (
-py -3.12 -m venv --clear --upgrade-deps .env_win
-call ".env_win/scripts/activate.bat"
+echo ""
+echo "Installing BuildTools"
+winget install --id=Microsoft.VisualStudio.2022.BuildTools  -e
+
+echo "Making venv"
+py -3.12 -m venv --clear --upgrade-deps .venv
+if %errorlevel% neq 0 (
+    echo "Error installing requirements. Please check the output above."
+    goto :EOF
+)
+call ".venv/scripts/activate.bat"
 
 echo "Installing. Please Wait...."
-
+python -m pip install --upgrade pip
 pip --disable-pip-version-check install --no-clean -r requirements.txt
+
+if %errorlevel% neq 0 (
+    echo "Error installing requirements. Please check the output above."
+    goto :EOF
+)
 
  python -c "import gradio_interface; gradio_interface.load_model_if_needed('Zyphra/Zonos-v0.1-hybrid')"
  python -c "import gradio_interface; gradio_interface.load_model_if_needed('Zyphra/Zonos-v0.1-transformer')"
@@ -25,3 +38,7 @@ call ".env_win\Scripts\deactivate.bat"
 echo(
 echo If all worked ok then run:
 echo 2_Start_Zonos.bat
+
+:EOF
+call ".venv\Scripts\deactivate.bat"
+pause
