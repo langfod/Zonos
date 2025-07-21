@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
 Zonos Text-to-Speech Application with Gradio Interface
+Enhanced with disk and memory caching for speaker embeddings
 """
 
 # Standard library imports
@@ -12,15 +13,16 @@ import logging
 
 # Third-party imports
 import torch
-import torchaudio
 import gradio as gr
 
 # Local imports - utilities
 from utilities.config_utils import (update_model_paths_file, parse_model_paths_file, is_online_model)
-from utilities.file_utils import (lcx_checkmodels)
+from utilities.file_utils import (lcx_checkmodels, get_cache_dir)
 from utilities.report import generate_troubleshooting_report
 from utilities.system_info import (get_gpu_device)
-from utilities.audio_utils import (process_speaker_audio, process_prefix_audio, convert_audio_to_numpy)
+from utilities.audio_utils import (process_speaker_audio, process_prefix_audio, convert_audio_to_numpy,
+                                 configure_speaker_cache, get_speaker_cache_stats, print_speaker_cache_stats,
+                                 clear_speaker_cache)
 from utilities.model_utils import (load_model_if_needed, get_supported_models)
 from utilities.gradio_utils import (update_ui_visibility)
 
@@ -45,7 +47,10 @@ in_dotenv_needed_models = {"Zyphra/Zonos-v0.1-hybrid", "Zyphra/Zonos-v0.1-transf
 in_dotenv_needed_paths = {"HF_HOME": "./models/hf_download"}
 in_dotenv_needed_params = {
     "DISABLE_TORCH_COMPILE_DEFAULT": de_disable_torch_compile_default,
-    "DEBUG_MODE": True
+    "DEBUG_MODE": False,
+    "CACHE_DIR": "./cache/speaker_embeddings",
+    "CACHE_MEMORY_SIZE": 100,
+    "CACHE_EXPIRY_HOURS": 24 * 7  # 1 week
 }
 in_files_to_check_in_paths = []
 
@@ -108,6 +113,30 @@ if "HF_HOME" in in_dotenv_needed_paths:
 os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
 
 # =============================================================================
+# CACHE CONFIGURATION
+# =============================================================================
+
+# Configure speaker embedding cache to use local script directory
+cache_dir = out_dotenv_loaded_params.get("CACHE_DIR")
+cache_memory_size = int(out_dotenv_loaded_params.get("CACHE_MEMORY_SIZE", 100))
+cache_expiry_hours = float(out_dotenv_loaded_params.get("CACHE_EXPIRY_HOURS", 24 * 7))
+
+# Ensure cache directory exists and is writable
+
+logging.info(f"Cache directory set to: {cache_dir}")
+
+try:
+    configure_speaker_cache(
+        cache_dir=cache_dir,
+        memory_cache_size=cache_memory_size,
+        enable_disk_cache=True,
+        cache_expiry_hours=cache_expiry_hours
+    )
+    logging.info(f"Speaker embedding cache configured: {cache_dir}")
+except Exception as e:
+    logging.warning(f"Failed to configure speaker cache: {e}")
+
+# =============================================================================
 # COMMAND LINE ARGUMENT PARSING
 # =============================================================================
 
@@ -120,6 +149,9 @@ parser.add_argument("--output_dir", type=str, default='./outputs')
 parser.add_argument("--checkmodels", action='store_true')
 parser.add_argument("--integritycheck", action='store_true')
 parser.add_argument("--sysreport", action='store_true')
+parser.add_argument("--cache-stats", action='store_true', help='Show speaker cache statistics')
+parser.add_argument("--clear-cache", action='store_true', help='Clear speaker embedding cache')
+parser.add_argument("--disable-cache", action='store_true', help='Disable speaker embedding caching')
 args = parser.parse_args()
 
 # Handle command line options
@@ -130,6 +162,15 @@ if args.checkmodels:
 if args.sysreport:
     full_report = generate_troubleshooting_report(in_model_config_file=in_model_config_file)
     print(full_report)
+    sys.exit()
+
+if args.cache_stats:
+    print_speaker_cache_stats()
+    sys.exit()
+
+if args.clear_cache:
+    clear_speaker_cache()
+    print("Speaker embedding cache cleared.")
     sys.exit()
 
 if debug_mode:
@@ -168,18 +209,18 @@ def generate_audio(model_choice, text, language, speaker_audio, prefix_audio, e1
                   top_k, min_p, linear, confidence, quadratic, seed, randomize_seed, unconditional_keys,
                   disable_torch_compile=disable_torch_compile_default, progress=gr.Progress()):
     """
-    Generates audio based on the provided UI parameters.
+    Generates audio based on the provided UI parameters with enhanced caching.
     """
     # Start timing the entire function
     func_start_time = time.perf_counter()
 
     # Time the model loading specifically
-    logging.info("Checking/loading model...")
+    #logging.info("Checking/loading model...")
     load_start_time = time.perf_counter()
     selected_model = load_model_wrapper(model_choice)
     load_end_time = time.perf_counter()
     load_duration_ms = (load_end_time - load_start_time) * 1000
-    logging.info(f"Model loading took: {load_duration_ms:.2f} ms")
+    logging.info(f"Model loading took: {load_duration_ms:.10f} ms")
 
     # Convert parameters to appropriate types
     speaker_noised_bool = bool(speaker_noised)
@@ -200,14 +241,15 @@ def generate_audio(model_choice, text, language, speaker_audio, prefix_audio, e1
     # Handle speaker audio caching
     global SPEAKER_AUDIO_PATH, SPEAKER_AUDIO_PATH_DICT, SPEAKER_EMBEDDING
 
+    speaker_audio_uuid = seed
     if randomize_seed:
         seed = torch.randint(0, 2 ** 32 - 1, (1,)).item()
     torch.manual_seed(seed)
 
-    # Process speaker audio if provided
+    # Process speaker audio if provided (with enhanced caching)
     if speaker_audio is not None and "speaker" not in unconditional_keys:
         if speaker_audio not in SPEAKER_AUDIO_PATH_DICT:
-            SPEAKER_EMBEDDING = process_speaker_audio(speaker_audio, selected_model, device, SPEAKER_AUDIO_PATH_DICT)
+            SPEAKER_EMBEDDING = process_speaker_audio(speaker_audio, selected_model, device, SPEAKER_AUDIO_PATH_DICT,speaker_audio_uuid, model_choice)
             SPEAKER_AUDIO_PATH = speaker_audio
         else:
             if speaker_audio != SPEAKER_AUDIO_PATH:
@@ -248,7 +290,7 @@ def generate_audio(model_choice, text, language, speaker_audio, prefix_audio, e1
         disable_torch_compile=disable_torch_compile,
         sampling_params=dict(top_p=top_p, top_k=top_k, min_p=min_p, linear=linear,
                            conf=confidence, quad=quadratic),
-        callback=update_progress, progress_bar=False
+        callback=update_progress,
     )
 
     # Decode audio and convert to numpy
@@ -258,17 +300,49 @@ def generate_audio(model_choice, text, language, speaker_audio, prefix_audio, e1
     # Log execution time
     func_end_time = time.perf_counter()
     total_duration_s = func_end_time - func_start_time
-    logging.info(f"Total 'generate_audio' for {speaker_audio} execution time: {total_duration_s:.2f} seconds")
+    logging.info(f"Total 'generate_audio' for {speaker_audio.split('\\')[-1]} execution time: {total_duration_s:.2f} seconds")
     sys.stdout.flush()
 
     return (sr_out, wav_np), seed
 
 
+def show_cache_stats():
+    """Return cache statistics as a formatted string."""
+    try:
+        stats = get_speaker_cache_stats()
+        if stats.get("cache_available", True):
+            return f"""
+**Speaker Embedding Cache Statistics:**
+- Memory Cache: {stats['memory_cache_size']}/{stats['memory_cache_max_size']} entries
+- Total Requests: {stats['total_requests']}
+- Hit Rate: {stats['hit_rate_percent']}%
+- Memory Hits: {stats['memory_hits']}
+- Disk Hits: {stats['disk_hits']}
+- Misses: {stats['misses']}
+- Cache Directory: {stats['cache_directory']}
+            """
+        else:
+            return "Speaker embedding cache is not available."
+    except Exception as e:
+        return f"Error retrieving cache stats: {e}"
+
+
+def clear_cache_interface():
+    """Clear the speaker embedding cache and return confirmation."""
+    try:
+        clear_speaker_cache()
+        return "✅ Speaker embedding cache cleared successfully!"
+    except Exception as e:
+        return f"❌ Error clearing cache: {e}"
+
+
 def build_interface():
-    """Build and return the Gradio interface."""
+    """Build and return the Gradio interface with cache management."""
     supported_models = get_supported_models(ZonosBackbone, AI_MODEL_DIR_HY, AI_MODEL_DIR_TF)
 
-    with gr.Blocks(analytics_enabled=False) as demo:
+    with gr.Blocks(analytics_enabled=False, title="Zonos TTS with Enhanced Caching") as demo:
+        gr.Markdown("# Zonos Text-to-Speech with Speaker Embedding Cache")
+
         with gr.Row():
             with gr.Column():
                 model_choice = gr.Dropdown(choices=supported_models, value=supported_models[0],
@@ -344,10 +418,23 @@ def build_interface():
                 emotion7 = gr.Slider(0.0, 1.0, 0.1, 0.05, label="Other")
                 emotion8 = gr.Slider(0.0, 1.0, 0.2, 0.05, label="Neutral")
 
+        # Cache Management Section
+        with gr.Accordion("Cache Management", open=False):
+            gr.Markdown("### Speaker Embedding Cache")
+            gr.Markdown("The application uses an advanced caching system to store speaker embeddings, "
+                       "improving performance for repeated use of the same speaker audio.")
+
+            with gr.Row():
+                cache_stats_button = gr.Button("📊 Show Cache Stats")
+                clear_cache_button = gr.Button("🗑️ Clear Cache")
+
+            cache_info = gr.Markdown("Click 'Show Cache Stats' to view current cache status.")
+
         with gr.Column():
-            generate_button = gr.Button("Generate Audio")
+            generate_button = gr.Button("Generate Audio", variant="primary")
             output_audio = gr.Audio(label="Generated Audio", type="numpy", autoplay=True)
 
+        # Event handlers
         model_choice.change(fn=update_ui, inputs=[model_choice],
             outputs=[text, language, speaker_audio, prefix_audio, emotion1, emotion2, emotion3, emotion4, emotion5,
                 emotion6, emotion7, emotion8, vq_single_slider, fmax_slider, pitch_std_slider, speaking_rate_slider,
@@ -365,6 +452,10 @@ def build_interface():
                 min_k_slider, min_p_slider, linear_slider, confidence_slider, quadratic_slider, seed_number,
                 randomize_seed_toggle, unconditional_keys, ], outputs=[output_audio, seed_number], )
 
+        # Cache management event handlers
+        cache_stats_button.click(fn=show_cache_stats, outputs=cache_info)
+        clear_cache_button.click(fn=clear_cache_interface, outputs=cache_info)
+
     return demo
 
 
@@ -374,6 +465,15 @@ def build_interface():
 
 if __name__ == "__main__":
     gr.set_static_paths(paths=["assets/"])
+
+    # Initialize cache if not disabled
+    if not args.disable_cache:
+        try:
+            # Print initial cache stats
+            print_speaker_cache_stats()
+        except Exception as e:
+            logging.warning(f"Error displaying initial cache stats: {e}")
+
     load_model_wrapper("Zyphra/Zonos-v0.1-hybrid")
     demo = build_interface()
     demo.launch(server_name=args.server, server_port=args.port, share=args.share, inbrowser=args.inbrowser)

@@ -386,7 +386,7 @@ class SpeakerEmbedding(nn.Module):
 
 
 class SpeakerEmbeddingLDA(nn.Module):
-    def __init__(self, device: str = DEFAULT_DEVICE):
+    def __init__(self, device: str = DEFAULT_DEVICE, enable_cache: bool = True):
         super().__init__()
         spk_model_path = hf_hub_download(
             repo_id="Zyphra/Zonos-v0.1-speaker-embedding",
@@ -398,6 +398,21 @@ class SpeakerEmbeddingLDA(nn.Module):
         )
 
         self.device = device
+        self.enable_cache = enable_cache
+
+        # Initialize cache if enabled - use existing global cache
+        if self.enable_cache:
+            try:
+                from utilities.speaker_cache import get_global_speaker_cache
+                self._cache = get_global_speaker_cache()
+            except ImportError:
+                import logging
+                logging.warning("Speaker cache not available, disabling caching")
+                self.enable_cache = False
+                self._cache = None
+        else:
+            self._cache = None
+
         with torch.device(device):
             self.model = SpeakerEmbedding(spk_model_path, device)
             lda_sd = torch.load(lda_spk_model_path, weights_only=True)
@@ -407,6 +422,74 @@ class SpeakerEmbeddingLDA(nn.Module):
 
         self.requires_grad_(False).eval()
 
-    def forward(self, wav: torch.Tensor, sample_rate: int):
+    def _get_model_signature(self) -> str:
+        """Get a signature for the current model configuration."""
+        return "SpeakerEmbeddingLDA_v1"
+
+    def forward(self, wav: torch.Tensor, sample_rate: int, audio_path: str = None, audio_uuid = None, model_choice: str = None):
+        """
+        Forward pass with optional caching support.
+
+        Args:
+            wav: Audio tensor
+            sample_rate: Sample rate of the audio
+            audio_path: Optional path to audio file for caching (recommended)
+            audio_uuid: Optional UUID for unique identification (C++ unsigned int)
+            model_choice: Full model choice string (e.g., "Zyphra/Zonos-v0.1-hybrid")
+
+        Returns:
+            Tuple of (base_embedding, lda_embedding)
+        """
+        # Try to get from cache first if audio_path is provided and caching is enabled
+        if self.enable_cache and self._cache and audio_path:
+            # Use model_choice if provided, otherwise fall back to model signature
+            cache_model_type = model_choice if model_choice else self._get_model_signature()
+
+            # Try to get cached result with UUID
+            cached_result = self._cache.get(audio_path, cache_model_type, audio_uuid)
+            if cached_result is not None:
+                # Cached result should be a tuple of (base_emb, lda_emb)
+                if isinstance(cached_result, tuple) and len(cached_result) == 2:
+                    base_emb, lda_emb = cached_result
+                    # Move to correct device and dtype
+                    base_emb = base_emb.to(self.device, dtype=wav.dtype)
+                    lda_emb = lda_emb.to(self.device, dtype=wav.dtype)
+                    return base_emb, lda_emb
+
+        # Compute embeddings
         emb = self.model(wav, sample_rate).to(torch.float32)
-        return emb, self.lda(emb)
+        lda_emb = self.lda(emb)
+
+        # Cache the result if enabled and audio_path is provided
+        if self.enable_cache and self._cache and audio_path:
+            try:
+                # Store both embeddings as a tuple on CPU
+                # Make sure each tensor is properly detached before creating the tuple
+                base_emb_cpu = emb.detach().cpu()
+                lda_emb_cpu = lda_emb.detach().cpu()
+                cache_data = (base_emb_cpu, lda_emb_cpu)
+                cache_model_type = model_choice if model_choice else self._get_model_signature()
+                self._cache.put(audio_path, cache_data, cache_model_type, audio_uuid)
+            except Exception as e:
+                import logging
+                logging.warning(f"Failed to cache speaker embedding: {e}")
+
+        return emb, lda_emb
+
+    def get_cache_stats(self):
+        """Get cache statistics if caching is enabled."""
+        if self.enable_cache and self._cache:
+            return self._cache.get_cache_stats()
+        return {"cache_enabled": False}
+
+    def clear_cache(self):
+        """Clear the speaker embedding cache."""
+        if self.enable_cache and self._cache:
+            self._cache.clear_all_cache()
+
+    def print_cache_stats(self):
+        """Print cache statistics."""
+        if self.enable_cache and self._cache:
+            self._cache.print_cache_stats()
+        else:
+            print("Speaker embedding cache is disabled")
