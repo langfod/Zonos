@@ -1,11 +1,6 @@
 @echo off
 
-echo Starting Zonos:
-
-call ".env_win\Scripts\deactivate.bat"
-
-call ".venv/scripts/activate.bat"
-
+echo Starting Zonos in new window...
+call .venv\scripts\activate.bat
 start "Zonos" /high python appzonos.py
-
-call ".venv\Scripts\deactivate.bat"
+call .venv\Scripts\deactivate.bat
