@@ -211,6 +211,7 @@ def generate_audio(model_choice, text, language, speaker_audio, prefix_audio, e1
     """
     Generates audio based on the provided UI parameters with enhanced caching.
     """
+    print(f"inputs: model_choice={model_choice}, text={text}, language={language}, speaker_audio={speaker_audio}, seed={seed}")
     # Start timing the entire function
     func_start_time = time.perf_counter()
 
@@ -220,7 +221,8 @@ def generate_audio(model_choice, text, language, speaker_audio, prefix_audio, e1
     selected_model = load_model_wrapper(model_choice)
     load_end_time = time.perf_counter()
     load_duration_ms = (load_end_time - load_start_time) * 1000
-    logging.info(f"Model loading took: {load_duration_ms:.10f} ms")
+    if load_duration_ms > .005:
+        logging.info(f"Model loading took: {load_duration_ms:.10f} ms")
 
     # Convert parameters to appropriate types
     speaker_noised_bool = bool(speaker_noised)
@@ -294,16 +296,20 @@ def generate_audio(model_choice, text, language, speaker_audio, prefix_audio, e1
     )
 
     # Decode audio and convert to numpy
-    wav_gpu_f32 = selected_model.autoencoder.decode(codes)
-    sr_out, wav_np = convert_audio_to_numpy(wav_gpu_f32, selected_model.autoencoder.sampling_rate)
+    #wav_gpu_f32 = selected_model.autoencoder.decode(codes)
+    #sr_out, wav_np = convert_audio_to_numpy(wav_gpu_f32, selected_model.autoencoder.sampling_rate)
+    wav_np = selected_model.autoencoder.decode_to_int16(codes)
 
     # Log execution time
     func_end_time = time.perf_counter()
     total_duration_s = func_end_time - func_start_time
-    logging.info(f"Total 'generate_audio' for {speaker_audio.split('\\')[-1]} execution time: {total_duration_s:.2f} seconds")
+    if speaker_audio:
+        logging.info(f"Total 'generate_audio' for {speaker_audio.split('\\')[-1]} execution time: {total_duration_s:.2f} seconds")
+    else:
+        logging.info(f"Total 'generate_audio' execution time: {total_duration_s:.2f} seconds")
     sys.stdout.flush()
 
-    return (sr_out, wav_np), seed
+    return (selected_model.autoencoder.sampling_rate, wav_np), seed
 
 
 def show_cache_stats():
@@ -464,7 +470,7 @@ def build_interface():
 # =============================================================================
 
 if __name__ == "__main__":
-    gr.set_static_paths(paths=["assets/"])
+    gr.set_static_paths(paths=["assets/","cache"])
 
     # Initialize cache if not disabled
     if not args.disable_cache:

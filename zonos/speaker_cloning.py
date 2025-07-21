@@ -400,6 +400,9 @@ class SpeakerEmbeddingLDA(nn.Module):
         self.device = device
         self.enable_cache = enable_cache
 
+        # Cache the model signature to avoid repeated computation
+        self._model_signature = "SpeakerEmbeddingLDA_v1"
+
         # Initialize cache if enabled - use existing global cache
         if self.enable_cache:
             try:
@@ -424,7 +427,7 @@ class SpeakerEmbeddingLDA(nn.Module):
 
     def _get_model_signature(self) -> str:
         """Get a signature for the current model configuration."""
-        return "SpeakerEmbeddingLDA_v1"
+        return self._model_signature
 
     def forward(self, wav: torch.Tensor, sample_rate: int, audio_path: str = None, audio_uuid = None, model_choice: str = None):
         """
@@ -440,39 +443,58 @@ class SpeakerEmbeddingLDA(nn.Module):
         Returns:
             Tuple of (base_embedding, lda_embedding)
         """
+        # Determine cache model type once
+        cache_model_type = model_choice if model_choice else self._model_signature
+
         # Try to get from cache first if audio_path is provided and caching is enabled
         if self.enable_cache and self._cache and audio_path:
-            # Use model_choice if provided, otherwise fall back to model signature
-            cache_model_type = model_choice if model_choice else self._get_model_signature()
-
-            # Try to get cached result with UUID
-            cached_result = self._cache.get(audio_path, cache_model_type, audio_uuid)
+            # Try to get cached result with UUID, specifying target device to avoid extra copies
+            cached_result = self._cache.get(audio_path, cache_model_type, audio_uuid, target_device=self.device)
             if cached_result is not None:
                 # Cached result should be a tuple of (base_emb, lda_emb)
                 if isinstance(cached_result, tuple) and len(cached_result) == 2:
                     base_emb, lda_emb = cached_result
-                    # Move to correct device and dtype
-                    base_emb = base_emb.to(self.device, dtype=wav.dtype)
-                    lda_emb = lda_emb.to(self.device, dtype=wav.dtype)
+                    # Ensure correct dtype (device should already be correct from cache.get())
+                    if base_emb.dtype != wav.dtype:
+                        base_emb = base_emb.to(dtype=wav.dtype)
+                        lda_emb = lda_emb.to(dtype=wav.dtype)
                     return base_emb, lda_emb
 
-        # Compute embeddings
-        emb = self.model(wav, sample_rate).to(torch.float32)
-        lda_emb = self.lda(emb)
+        # Compute embeddings - reduce device transfers
+        # Get input tensor on correct device and dtype in one operation
+        wav_input = wav.to(self.device, dtype=wav.dtype) if wav.device != self.device or wav.dtype != wav.dtype else wav
+
+        # Compute base embedding
+        emb = self.model(wav_input, sample_rate)
+
+        # Convert to float32 for LDA only if needed
+        if emb.dtype != torch.float32:
+            emb_f32 = emb.to(torch.float32)
+        else:
+            emb_f32 = emb
+
+        # Compute LDA embedding
+        lda_emb = self.lda(emb_f32)
 
         # Cache the result if enabled and audio_path is provided
+        # Only create CPU copies if we're actually going to cache
         if self.enable_cache and self._cache and audio_path:
             try:
-                # Store both embeddings as a tuple on CPU
-                # Make sure each tensor is properly detached before creating the tuple
+                # Efficiently create CPU copies only when needed
+                # Detach first to avoid gradients, then move to CPU in one operation
                 base_emb_cpu = emb.detach().cpu()
                 lda_emb_cpu = lda_emb.detach().cpu()
                 cache_data = (base_emb_cpu, lda_emb_cpu)
-                cache_model_type = model_choice if model_choice else self._get_model_signature()
                 self._cache.put(audio_path, cache_data, cache_model_type, audio_uuid)
             except Exception as e:
                 import logging
                 logging.warning(f"Failed to cache speaker embedding: {e}")
+
+        # Return tensors with consistent dtype (convert LDA back to input dtype if needed)
+        if lda_emb.dtype != wav.dtype:
+            lda_emb = lda_emb.to(dtype=wav.dtype)
+        if emb.dtype != wav.dtype:
+            emb = emb.to(dtype=wav.dtype)
 
         return emb, lda_emb
 

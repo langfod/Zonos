@@ -1,229 +1,153 @@
 """
 Speaker embedding cache system for Zonos application.
-Provides both memory and disk caching with torch.compile compatibility and thread safety.
+Thread-safe disk and memory caching with torch.compile compatibility.
+GPU-optimized for PyTorch 2.7.1 cu128.
 """
 
 import threading
 import time
 import logging
 from pathlib import Path
-from typing import Dict, Optional, Any
+from typing import Dict, Optional, Any, Union
 from collections import OrderedDict
 import torch
-
 from threading import RLock
-from utilities.file_utils import (get_cache_dir)
+from utilities.file_utils import get_cache_dir
+
 
 class SpeakerEmbeddingCache:
-    """
-    Thread-safe cache system for speaker embeddings with memory and disk storage.
+    """Thread-safe cache system for speaker embeddings with GPU-optimized memory and disk storage."""
 
-    Features:
-    - LRU memory cache with configurable size
-    - Persistent disk cache using torch.save/torch.load
-    - Thread-safe operations with RLock
-    - Cache key generation from filename and audio properties
-    - Torch.compile compatible
-    - Automatic cache cleanup and maintenance
-    """
-
-    def __init__(
-        self,
-        cache_dir: str = None,
-        memory_cache_size: int = 100,
-        enable_disk_cache: bool = True,
-        cache_expiry_hours: float = 24 * 7,  # 1 week default
-        auto_cleanup: bool = True
-    ):
+    def __init__(self, cache_dir: str = None, memory_cache_size: int = 100,
+                 enable_disk_cache: bool = True, cache_expiry_hours: float = 24 * 7,
+                 gpu_memory_cache: bool = True):
         self.cache_dir = get_cache_dir(cache_dir)
         self.memory_cache_size = memory_cache_size
         self.enable_disk_cache = enable_disk_cache
         self.cache_expiry_seconds = cache_expiry_hours * 3600
-        self.auto_cleanup = auto_cleanup
+        self.gpu_memory_cache = gpu_memory_cache and torch.cuda.is_available()
 
         # Thread safety
         self._lock = RLock()
 
-        # Memory cache: LRU implementation using OrderedDict
-        self._memory_cache: OrderedDict[str, torch.Tensor] = OrderedDict()
+        # Memory cache: LRU implementation (can store GPU or CPU tensors)
+        self._memory_cache: OrderedDict[str, Union[torch.Tensor, tuple]] = OrderedDict()
 
         # Cache statistics
-        self._stats = {
-            'memory_hits': 0,
-            'disk_hits': 0,
-            'misses': 0,
-            'saves': 0,
-            'evictions': 0
-        }
+        self._stats = {'memory_hits': 0, 'disk_hits': 0, 'misses': 0, 'saves': 0, 'gpu_hits': 0}
 
         # Initialize cache directory
         if self.enable_disk_cache:
             self.cache_dir.mkdir(parents=True, exist_ok=True)
-            if self.auto_cleanup:
-                self._cleanup_expired_cache()
 
-    def _generate_cache_key(self, audio_path: str, model_type: str = "default", audio_uuid: str = None) -> str:
-        """
-        Generate a unique cache key from audio file path, model type, and optional UUID.
-        Uses filename stem plus UUID for a readable and unique cache key.
-        """
-        try:
-            path = Path(audio_path)
-            file_stem = path.stem  # filename without extension
+        logging.info(f"Speaker cache: GPU memory cache {'enabled' if self.gpu_memory_cache else 'disabled'}")
 
-            # Extract model name from full model path (e.g., "Zonos-v0.1-hybrid" from "Zyphra/Zonos-v0.1-hybrid")
-            if "/" in model_type:
-                model_name = model_type.split("/")[-1]
-            else:
-                model_name = model_type
+    def _generate_cache_key(self, audio_path: str, model_type: str = "default", audio_uuid=None) -> str:
+        """Generate cache key from audio path, model type, and UUID."""
+        path = Path(audio_path)
+        file_stem = path.stem
 
-            # If UUID is provided, convert to hex format if it's a numeric value
-            if audio_uuid is not None:
-                if isinstance(audio_uuid, int):
-                    # Convert C++ unsigned int to hex format
-                    uuid_hex = hex(audio_uuid)[2:]  # Remove '0x' prefix
-                elif isinstance(audio_uuid, str) and audio_uuid.isdigit():
-                    # Handle string representation of numeric UUID
-                    uuid_hex = hex(int(audio_uuid))[2:]
-                else:
-                    # Use as-is for non-numeric UUIDs
-                    uuid_hex = str(audio_uuid)
+        # Extract model name (e.g., "Zonos-v0.1-hybrid" from "Zyphra/Zonos-v0.1-hybrid")
+        model_name = model_type.split("/")[-1] if "/" in model_type else model_type
 
-                cache_key = f"spk_emb_{file_stem}_{uuid_hex}_{model_name}"
-            else:
-                # Fallback: use file size and mtime if file exists
-                if path.exists():
-                    stat = path.stat()
-                    cache_key = f"spk_emb_{file_stem}_{stat.st_size}_{int(stat.st_mtime)}_{model_name}"
-                else:
-                    # For non-existent files, use just the filename and model type
-                    cache_key = f"spk_emb_{file_stem}_{model_name}"
+        # Use UUID if provided, otherwise use file properties
+        if audio_uuid is not None:
+            uuid_hex = hex(audio_uuid)[2:] if isinstance(audio_uuid, int) else str(audio_uuid)
+            cache_key = f"spk_emb_{file_stem}_{uuid_hex}_{model_name}"
+        else:
+            cache_key = f"spk_emb_{file_stem}_{model_name}"
 
-            # Sanitize the cache key for filesystem compatibility
-            # Replace any potentially problematic characters
-            cache_key = cache_key.replace(" ", "_").replace("/", "_").replace("\\", "_")
-            cache_key = "".join(c for c in cache_key if c.isalnum() or c in "._-")
-
-            return cache_key
-
-        except Exception as e:
-            logging.warning(f"Error generating cache key for {audio_path}: {e}")
-            # Fallback to simple filename-based key
-            file_stem = Path(audio_path).stem
-            model_name = model_type.split("/")[-1] if "/" in model_type else model_type
-            fallback_key = f"spk_emb_{file_stem}_{model_name}"
-            return "".join(c for c in fallback_key if c.isalnum() or c in "._-")
+        # Sanitize for filesystem
+        return "".join(c for c in cache_key if c.isalnum() or c in "._-")
 
     def _get_disk_cache_path(self, cache_key: str) -> Path:
-        """Get the disk cache file path for a given cache key."""
+        """Get disk cache file path."""
         return self.cache_dir / f"{cache_key}.pt"
 
     def _is_cache_valid(self, cache_path: Path) -> bool:
-        """Check if a disk cache file is still valid (not expired)."""
+        """Check if cache file is still valid (not expired)."""
         if not cache_path.exists():
             return False
-
         try:
             age = time.time() - cache_path.stat().st_mtime
             return age < self.cache_expiry_seconds
         except Exception:
             return False
 
-    def _cleanup_expired_cache(self):
-        """Remove expired cache files from disk."""
-        if not self.enable_disk_cache or not self.cache_dir.exists():
-            return
+    @staticmethod
+    def _move_to_target_device(embedding, target_device: torch.device):
+        """Move embedding(s) to target device, handling both single tensors and tuples."""
+        if isinstance(embedding, tuple):
+            return tuple(tensor.to(target_device) for tensor in embedding)
+        else:
+            return embedding.to(target_device)
 
-        try:
-            current_time = time.time()
-            removed_count = 0
+    def get(self, audio_path: str, model_type: str = "default", audio_uuid=None,
+            target_device: torch.device = None) -> Optional[torch.Tensor]:
+        """Retrieve embedding from cache."""
 
-            for cache_file in self.cache_dir.glob("spk_emb_*.pt"):
-                try:
-                    if current_time - cache_file.stat().st_mtime > self.cache_expiry_seconds:
-                        cache_file.unlink()
-                        removed_count += 1
-                except Exception as e:
-                    logging.warning(f"Error removing expired cache file {cache_file}: {e}")
-
-            if removed_count > 0:
-                logging.info(f"Cleaned up {removed_count} expired cache files")
-
-        except Exception as e:
-            logging.error(f"Error during cache cleanup: {e}")
-
-    def _evict_lru_memory(self):
-        """Remove least recently used item from memory cache."""
-        if self._memory_cache:
-            evicted_key, _ = self._memory_cache.popitem(last=False)
-            self._stats['evictions'] += 1
-            logging.debug(f"Evicted LRU cache entry: {evicted_key}")
-
-    def get(self, audio_path: str, model_type: str = "default", audio_uuid = None) -> Optional[torch.Tensor]:
-        """
-        Retrieve speaker embedding from cache.
-
-        Args:
-            audio_path: Path to the audio file
-            model_type: Type/version of the embedding model
-            audio_uuid: Optional UUID for unique identification (C++ unsigned int or equivalent)
-
-        Returns:
-            Cached embedding tensor or None if not found
-        """
         cache_key = self._generate_cache_key(audio_path, model_type, audio_uuid)
 
         with self._lock:
             # Try memory cache first
             if cache_key in self._memory_cache:
-                # Move to end (most recently used)
                 embedding = self._memory_cache.pop(cache_key)
-                self._memory_cache[cache_key] = embedding
+                self._memory_cache[cache_key] = embedding  # Move to end (LRU)
                 self._stats['memory_hits'] += 1
-                logging.debug(f"Memory cache hit for {cache_key}")
-                return embedding.clone()  # Return clone for safety
+
+                # Track GPU cache hits
+                if isinstance(embedding, tuple):
+                    if embedding[0].is_cuda:
+                        self._stats['gpu_hits'] += 1
+                elif hasattr(embedding, 'is_cuda') and embedding.is_cuda:
+                    self._stats['gpu_hits'] += 1
+
+                # Move to target device if specified
+                if target_device is not None:
+                    embedding = self._move_to_target_device(embedding, target_device)
+
+                return embedding
 
             # Try disk cache
             if self.enable_disk_cache:
                 cache_path = self._get_disk_cache_path(cache_key)
                 if self._is_cache_valid(cache_path):
                     try:
+                        # Load to CPU first, then move to appropriate device
                         embedding = torch.load(cache_path, map_location='cpu', weights_only=True)
+
+                        # Determine target device for memory cache storage
+                        if self.gpu_memory_cache and target_device and target_device.type == 'cuda':
+                            # Store in GPU memory cache and return on target device
+                            gpu_embedding = self._move_to_target_device(embedding, target_device)
+                            cache_embedding = gpu_embedding
+                            result_embedding = gpu_embedding
+                        elif target_device:
+                            # Move to target device for return, but store CPU version in cache
+                            result_embedding = self._move_to_target_device(embedding, target_device)
+                            cache_embedding = embedding  # Keep CPU version for cache
+                        else:
+                            # No target device specified, use original
+                            cache_embedding = result_embedding = embedding
 
                         # Add to memory cache
                         if len(self._memory_cache) >= self.memory_cache_size:
-                            self._evict_lru_memory()
-                        self._memory_cache[cache_key] = embedding.clone()
+                            self._memory_cache.popitem(last=False)  # Remove LRU
+                        self._memory_cache[cache_key] = cache_embedding
 
                         self._stats['disk_hits'] += 1
-                        logging.debug(f"Disk cache hit for {cache_key}")
-                        return embedding.clone()
+                        return result_embedding
 
                     except Exception as e:
-                        logging.warning(f"Error loading cached embedding from {cache_path}: {e}")
-                        # Remove corrupted cache file
-                        try:
-                            cache_path.unlink()
-                        except Exception:
-                            pass
+                        logging.warning(f"Error loading cached embedding: {e}")
+                        cache_path.unlink(missing_ok=True)  # Remove corrupted file
 
             # Cache miss
             self._stats['misses'] += 1
             return None
 
-    def put(self, audio_path: str, embedding: torch.Tensor, model_type: str = "default", audio_uuid = None) -> bool:
-        """
-        Store speaker embedding in cache.
-
-        Args:
-            audio_path: Path to the audio file
-            embedding: The embedding tensor to cache (can be a single tensor or tuple of tensors)
-            model_type: Type/version of the embedding model
-            audio_uuid: Optional UUID for unique identification (C++ unsigned int or equivalent)
-
-        Returns:
-            True if successfully cached, False otherwise
-        """
+    def put(self, audio_path: str, embedding, model_type: str = "default", audio_uuid=None) -> bool:
+        """Store embedding in cache with GPU optimization."""
         if embedding is None:
             return False
 
@@ -231,111 +155,80 @@ class SpeakerEmbeddingCache:
 
         with self._lock:
             try:
+                # Handle both single tensors and tuples
+                if isinstance(embedding, tuple):
+                    # For tuples, tensors should already be detached in SpeakerEmbeddingLDA
+                    memory_embedding = embedding
+                    # Always save CPU version to disk
+                    disk_embedding = tuple(tensor.detach().cpu() for tensor in embedding)
+                else:
+                    # For single tensors
+                    if self.gpu_memory_cache and embedding.is_cuda:
+                        # Keep GPU version in memory, save CPU version to disk
+                        memory_embedding = embedding.detach()
+                        disk_embedding = embedding.detach().cpu()
+                    else:
+                        # Store CPU version
+                        memory_embedding = disk_embedding = embedding.detach().cpu()
+
                 # Store in memory cache
                 if len(self._memory_cache) >= self.memory_cache_size:
-                    self._evict_lru_memory()
+                    self._memory_cache.popitem(last=False)  # Remove LRU
+                self._memory_cache[cache_key] = memory_embedding
 
-                # Handle both single tensors and tuples of tensors
-                if isinstance(embedding, tuple):
-                    # For tuples (like from SpeakerEmbeddingLDA), the tensors should already be detached
-                    cpu_embedding = embedding
-                else:
-                    # For single tensors, detach and move to CPU
-                    cpu_embedding = embedding.detach().cpu()
-
-                self._memory_cache[cache_key] = cpu_embedding
-
-                # Store to disk cache
+                # Store to disk cache (always CPU for compatibility)
                 if self.enable_disk_cache:
                     cache_path = self._get_disk_cache_path(cache_key)
-                    try:
-                        # Use atomic write to prevent corruption
-                        temp_path = cache_path.with_suffix('.tmp')
-                        torch.save(cpu_embedding, temp_path)
-                        temp_path.replace(cache_path)
-                        logging.debug(f"Saved embedding to disk cache: {cache_path}")
-                    except Exception as e:
-                        logging.warning(f"Error saving embedding to disk cache: {e}")
-                        # Clean up temp file if it exists
-                        if temp_path.exists():
-                            try:
-                                temp_path.unlink()
-                            except Exception:
-                                pass
+                    torch.save(disk_embedding, cache_path)
 
                 self._stats['saves'] += 1
                 return True
-
             except Exception as e:
-                logging.error(f"Error caching embedding for {audio_path}: {e}")
+                logging.error(f"Error caching embedding: {e}")
                 return False
-
-    def clear_memory_cache(self):
-        """Clear all entries from memory cache."""
-        with self._lock:
-            self._memory_cache.clear()
-            logging.info("Memory cache cleared")
-
-    def clear_disk_cache(self):
-        """Clear all entries from disk cache."""
-        if not self.enable_disk_cache:
-            return
-
-        with self._lock:
-            try:
-                removed_count = 0
-                for cache_file in self.cache_dir.glob("spk_emb_*.pt"):
-                    try:
-                        cache_file.unlink()
-                        removed_count += 1
-                    except Exception as e:
-                        logging.warning(f"Error removing cache file {cache_file}: {e}")
-
-                logging.info(f"Disk cache cleared, removed {removed_count} files")
-
-            except Exception as e:
-                logging.error(f"Error clearing disk cache: {e}")
 
     def clear_all_cache(self):
         """Clear both memory and disk caches."""
-        self.clear_memory_cache()
-        self.clear_disk_cache()
+        with self._lock:
+            self._memory_cache.clear()
+            if self.enable_disk_cache:
+                for cache_file in self.cache_dir.glob("spk_emb_*.pt"):
+                    cache_file.unlink(missing_ok=True)
 
     def get_cache_stats(self) -> Dict[str, Any]:
         """Get cache performance statistics."""
         with self._lock:
-            total_requests = self._stats['memory_hits'] + self._stats['disk_hits'] + self._stats['misses']
-            hit_rate = ((self._stats['memory_hits'] + self._stats['disk_hits']) / total_requests * 100) if total_requests > 0 else 0
+            total = self._stats['memory_hits'] + self._stats['disk_hits'] + self._stats['misses']
+            hit_rate = ((self._stats['memory_hits'] + self._stats['disk_hits']) / total * 100) if total > 0 else 0
+            gpu_hit_rate = (self._stats['gpu_hits'] / self._stats['memory_hits'] * 100) if self._stats['memory_hits'] > 0 else 0
 
             return {
                 'memory_cache_size': len(self._memory_cache),
                 'memory_cache_max_size': self.memory_cache_size,
                 'disk_cache_enabled': self.enable_disk_cache,
+                'gpu_memory_cache_enabled': self.gpu_memory_cache,
                 'cache_directory': str(self.cache_dir),
-                'total_requests': total_requests,
+                'total_requests': total,
                 'memory_hits': self._stats['memory_hits'],
                 'disk_hits': self._stats['disk_hits'],
                 'misses': self._stats['misses'],
                 'hit_rate_percent': round(hit_rate, 2),
-                'saves': self._stats['saves'],
-                'evictions': self._stats['evictions']
+                'gpu_hits': self._stats['gpu_hits'],
+                'gpu_hit_rate_percent': round(gpu_hit_rate, 2),
+                'saves': self._stats['saves']
             }
 
     def print_cache_stats(self):
         """Print formatted cache statistics."""
         stats = self.get_cache_stats()
-        print("\n=== Speaker Embedding Cache Statistics ===")
+        print(f"\n=== Speaker Embedding Cache Statistics ===")
         print(f"Memory Cache: {stats['memory_cache_size']}/{stats['memory_cache_max_size']} entries")
-        print(f"Disk Cache: {'Enabled' if stats['disk_cache_enabled'] else 'Disabled'}")
-        print(f"Cache Directory: {stats['cache_directory']}")
+        print(f"GPU Memory Cache: {'Enabled' if stats['gpu_memory_cache_enabled'] else 'Disabled'}")
         print(f"Total Requests: {stats['total_requests']}")
-        print(f"Memory Hits: {stats['memory_hits']}")
-        print(f"Disk Hits: {stats['disk_hits']}")
-        print(f"Misses: {stats['misses']}")
         print(f"Hit Rate: {stats['hit_rate_percent']}%")
-        print(f"Saves: {stats['saves']}")
-        print(f"Evictions: {stats['evictions']}")
-        print("=" * 42)
+        print(f"GPU Hit Rate: {stats['gpu_hit_rate_percent']}% of memory hits")
+        print(f"Cache Directory: {stats['cache_directory']}")
+        print("=" * 47)
 
 
 # Global cache instance
@@ -346,20 +239,16 @@ _cache_lock = threading.Lock()
 def get_global_speaker_cache() -> SpeakerEmbeddingCache:
     """Get or create the global speaker embedding cache instance."""
     global _global_speaker_cache
-
     if _global_speaker_cache is None:
         with _cache_lock:
             if _global_speaker_cache is None:
                 _global_speaker_cache = SpeakerEmbeddingCache()
-
     return _global_speaker_cache
 
 
 def configure_global_cache(**kwargs) -> SpeakerEmbeddingCache:
     """Configure the global speaker embedding cache with custom settings."""
     global _global_speaker_cache
-
     with _cache_lock:
         _global_speaker_cache = SpeakerEmbeddingCache(**kwargs)
-
     return _global_speaker_cache

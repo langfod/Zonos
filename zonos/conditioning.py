@@ -1,4 +1,4 @@
-from functools import cache
+from functools import cache, lru_cache
 from typing import Any, Literal, Iterable
 
 import torch
@@ -7,6 +7,19 @@ import torch.nn as nn
 from zonos.config import PrefixConditionerConfig
 from zonos.utils import DEFAULT_DEVICE
 
+# Cache language code mapping to avoid repeated computation
+@lru_cache(maxsize=1)
+def _get_language_code_to_id_map() -> dict[str, int]:
+    """Cache the language code to ID mapping to avoid repeated computation."""
+    return {lang: i for i, lang in enumerate(supported_language_codes)}
+
+# Cache commonly used tensor shapes and operations
+@lru_cache(maxsize=128)
+def _create_tensor_cache_key(value, device_type: str, dtype_str: str) -> str:
+    """Create a cache key for tensor operations."""
+    if isinstance(value, (list, tuple)):
+        return f"{hash(tuple(value))}_{device_type}_{dtype_str}"
+    return f"{hash(value)}_{device_type}_{dtype_str}"
 
 class Conditioner(nn.Module):
     def __init__(
@@ -76,7 +89,6 @@ elif sys.platform == "win32":
 
     os.environ['PHONEMIZER_ESPEAK_PATH'] = file_path1
     os.environ['PHONEMIZER_ESPEAK_LIBRARY'] = file_path2
-
 
 
 # --- Number normalization code from https://github.com/daniilrobnikov/vits2/blob/main/text/normalize_numbers.py ---
@@ -180,22 +192,35 @@ def tokenize_phonemes(phonemes: list[str]) -> tuple[torch.Tensor, list[int]]:
     return torch.tensor(phoneme_ids), lengths
 
 
-def normalize_jp_text(text: str, tokenizer=Dictionary(dict="full").create()) -> str:
+# Cache Japanese tokenizer to avoid repeated initialization
+@lru_cache(maxsize=1)
+def _get_jp_tokenizer():
+    """Cache Japanese tokenizer to avoid repeated initialization."""
+    return Dictionary(dict="full").create()
+
+
+def normalize_jp_text(text: str) -> str:
+    """Optimized Japanese text normalization with cached tokenizer."""
     text = unicodedata.normalize("NFKC", text)
     text = re.sub(r"\d+", lambda m: number2kanji(int(m[0])), text)
+    tokenizer = _get_jp_tokenizer()
     final_text = " ".join([x.reading_form() for x in tokenizer.tokenize(text, SplitMode.A)])
     return final_text
 
 
+# Cache cleaned text results to avoid repeated processing
+@lru_cache(maxsize=256)
+def _clean_text_cached(text: str, language: str) -> str:
+    """Cache cleaned text results to avoid repeated processing."""
+    if "ja" in language:
+        return normalize_jp_text(text)
+    else:
+        return normalize_numbers(text)
+
+
 def clean(texts: list[str], languages: list[str]) -> list[str]:
-    texts_out = []
-    for text, language in zip(texts, languages):
-        if "ja" in language:
-            text = normalize_jp_text(text)
-        else:
-            text = normalize_numbers(text)
-        texts_out.append(text)
-    return texts_out
+    """Optimized clean function with caching."""
+    return [_clean_text_cached(text, language) for text, language in zip(texts, languages)]
 
 
 @cache
@@ -216,16 +241,19 @@ def get_backend(language: str) -> "EspeakBackend":
     return backend
 
 
+# Cache phonemization results to avoid repeated computation
+@lru_cache(maxsize=512)
+def _phonemize_single_cached(text: str, language: str) -> str:
+    """Cache individual phonemization results to avoid repeated computation."""
+    cleaned_text = _clean_text_cached(text, language)
+    backend = get_backend(language)
+    phonemes = backend.phonemize([cleaned_text], strip=True)
+    return phonemes[0]
+
+
 def phonemize(texts: list[str], languages: list[str]) -> list[str]:
-    texts = clean(texts, languages)
-
-    batch_phonemes = []
-    for text, language in zip(texts, languages):
-        backend = get_backend(language)
-        phonemes = backend.phonemize([text], strip=True)
-        batch_phonemes.append(phonemes[0])
-
-    return batch_phonemes
+    """Optimized phonemize function with caching."""
+    return [_phonemize_single_cached(text, language) for text, language in zip(texts, languages)]
 
 
 class EspeakPhonemeConditioner(Conditioner):
@@ -266,9 +294,13 @@ class FourierConditioner(Conditioner):
         self.register_buffer("weight", torch.randn([output_dim // 2, input_dim]) * std)
         self.input_dim, self.min_val, self.max_val = input_dim, min_val, max_val
 
+        # Cache normalization factor to avoid repeated computation
+        self.register_buffer("_norm_factor", torch.tensor(self.max_val - self.min_val))
+
     def apply_cond(self, x: torch.Tensor) -> torch.Tensor:
         assert x.shape[-1] == self.input_dim
-        x = (x - self.min_val) / (self.max_val - self.min_val)  # [batch_size, seq_len, input_dim]
+        # Optimized normalization using cached factor
+        x = (x - self.min_val) / self._norm_factor  # [batch_size, seq_len, input_dim]
         f = 2 * torch.pi * x.to(self.weight.dtype) @ self.weight.T  # [batch_size, seq_len, output_dim // 2]
         return torch.cat([f.cos(), f.sin()], dim=-1)  # [batch_size, seq_len, output_dim]
 
@@ -281,8 +313,21 @@ class IntegerConditioner(Conditioner):
         self.int_embedder = nn.Embedding(max_val - min_val + 1, output_dim)
 
     def apply_cond(self, x: torch.Tensor) -> torch.Tensor:
-        assert x.shape[-1] == 1
-        return self.int_embedder(x.squeeze(-1) - self.min_val)  # [batch_size, seq_len, output_dim]
+        # Handle input tensor shape - it might be [1, 1] or [batch_size, seq_len, 1]
+        if x.dim() == 2:
+            # Input is [batch_size, seq_len], need to add feature dimension
+            x = x.unsqueeze(-1)  # Now [batch_size, seq_len, 1]
+
+        assert x.shape[-1] == 1, f"Expected last dimension to be 1, got {x.shape[-1]}"
+
+        # Apply embedding and ensure correct output shape
+        embedded = self.int_embedder(x.squeeze(-1) - self.min_val)  # [batch_size, seq_len, output_dim]
+
+        # Ensure we have the right shape [batch_size, 1, output_dim] for concatenation
+        if embedded.dim() == 2:
+            embedded = embedded.unsqueeze(1)  # Add sequence dimension
+
+        return embedded
 
 
 class PassthroughConditioner(Conditioner):
@@ -318,11 +363,30 @@ class PrefixConditioner(Conditioner):
             raise ValueError(f"Missing required keys: {self.required_keys - set(cond_dict)}")
         conds = []
         for conditioner in self.conditioners:
-            conds.append(conditioner(cond_dict.get(conditioner.name)))
-        max_bsz = max(map(len, conds))
-        assert all(c.shape[0] in (max_bsz, 1) for c in conds)
-        conds = [c.expand(max_bsz, -1, -1) for c in conds]
-        return self.norm(self.project(torch.cat(conds, dim=-2)))
+            cond_output = conditioner(cond_dict.get(conditioner.name))
+
+            # Ensure all outputs have 3D shape [batch_size, seq_len, feature_dim]
+            if cond_output.dim() == 2:
+                # Add sequence dimension: [batch_size, feature_dim] -> [batch_size, 1, feature_dim]
+                cond_output = cond_output.unsqueeze(1)
+            elif cond_output.dim() == 1:
+                # Add batch and sequence dimensions: [feature_dim] -> [1, 1, feature_dim]
+                cond_output = cond_output.unsqueeze(0).unsqueeze(0)
+
+            conds.append(cond_output)
+
+        # Ensure all tensors have consistent batch size
+        max_bsz = max(c.shape[0] for c in conds)
+
+        # Expand tensors to consistent batch size, ensuring they all have 3 dimensions
+        expanded_conds = []
+        for c in conds:
+            if c.shape[0] == 1 and max_bsz > 1:
+                # Expand batch dimension: [1, seq_len, feature_dim] -> [max_bsz, seq_len, feature_dim]
+                c = c.expand(max_bsz, -1, -1)
+            expanded_conds.append(c)
+
+        return self.norm(self.project(torch.cat(expanded_conds, dim=-2)))
 
 
 supported_language_codes = [
@@ -383,10 +447,13 @@ def make_cond_dict(
     """
     A helper to build the 'cond_dict' that the model expects.
     By default, it will generate a random speaker embedding
+
+    Optimized version with reduced GPU-to-CPU copies and caching.
     """
     assert language.lower() in supported_language_codes, "Please pick a supported language"
 
-    language_code_to_id = {lang: i for i, lang in enumerate(supported_language_codes)}
+    # Use cached language code mapping
+    language_code_to_id = _get_language_code_to_id_map()
 
     cond_dict = {
         "espeak": ([text], [language]),
@@ -402,16 +469,76 @@ def make_cond_dict(
         "speaker_noised": int(speaker_noised),
     }
 
+    # Remove unconditional keys early
     for k in unconditional_keys:
         cond_dict.pop(k, None)
 
+    # Optimize tensor operations - reduce device transfers and conversions
+    target_device = torch.device(device) if isinstance(device, str) else device
+
+    # Define which keys should be treated as integers (for IntegerConditioner)
+    integer_keys = {"language_id", "speaker_noised"}
+
+    # Process all non-tensor values efficiently
     for k, v in cond_dict.items():
         if isinstance(v, (float, int, list)):
-            v = torch.tensor(v)
-        if isinstance(v, torch.Tensor):
-            cond_dict[k] = v.view(1, 1, -1).to(device)
+            if isinstance(v, list):
+                # Create tensor directly on target device with appropriate dtype
+                tensor_val = torch.tensor(v, device=target_device, dtype=torch.float32)
+            else:
+                # Handle integer vs float types appropriately
+                if k in integer_keys:
+                    # For integer conditioners, use long dtype and don't reshape to (1,1,-1)
+                    tensor_val = torch.tensor(v, device=target_device, dtype=torch.long)
+                    cond_dict[k] = tensor_val.view(1, 1)  # Shape: [1, 1] for integer embeddings
+                    continue
+                else:
+                    # Create scalar tensor directly on target device
+                    tensor_val = torch.tensor(v, device=target_device, dtype=torch.float32)
 
-        if k == "emotion":
-            cond_dict[k] /= cond_dict[k].sum(dim=-1)
+            # Reshape efficiently - avoid multiple operations
+            cond_dict[k] = tensor_val.view(1, 1, -1)
+
+        elif isinstance(v, torch.Tensor):
+            # Minimize device transfers - only move if necessary
+            if v.device != target_device:
+                v = v.to(target_device)
+
+            # Handle integer tensors appropriately
+            if k in integer_keys and v.dtype.is_floating_point:
+                v = v.long()  # Convert to integer type
+                cond_dict[k] = v.view(1, 1)  # Shape: [1, 1] for integer embeddings
+            else:
+                cond_dict[k] = v.view(1, 1, -1)
+
+    # Normalize emotion efficiently if present
+    if "emotion" in cond_dict:
+        emotion_tensor = cond_dict["emotion"]
+        # Normalize in-place to avoid creating additional tensors
+        emotion_sum = emotion_tensor.sum(dim=-1, keepdim=True)
+        cond_dict["emotion"] = emotion_tensor / emotion_sum
 
     return cond_dict
+
+
+# Cache management utilities for debugging and monitoring
+def get_conditioning_cache_stats() -> dict:
+    """Get statistics about conditioning caches."""
+    return {
+        "phonemize_cache_size": _phonemize_single_cached.cache_info().currsize,
+        "phonemize_cache_hits": _phonemize_single_cached.cache_info().hits,
+        "phonemize_cache_misses": _phonemize_single_cached.cache_info().misses,
+        "text_clean_cache_size": _clean_text_cached.cache_info().currsize,
+        "text_clean_cache_hits": _clean_text_cached.cache_info().hits,
+        "text_clean_cache_misses": _clean_text_cached.cache_info().misses,
+        "backend_cache_size": len(get_backend.__wrapped__.__cache__),
+    }
+
+
+def clear_conditioning_caches():
+    """Clear all conditioning caches."""
+    _phonemize_single_cached.cache_clear()
+    _clean_text_cached.cache_clear()
+    get_backend.cache_clear()
+    _get_language_code_to_id_map.cache_clear()
+    _get_jp_tokenizer.cache_clear()
