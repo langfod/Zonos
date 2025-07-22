@@ -1,3 +1,4 @@
+import functools
 from functools import cache, lru_cache
 from typing import Any, Literal, Iterable
 
@@ -358,35 +359,98 @@ class PrefixConditioner(Conditioner):
         self.norm = nn.LayerNorm(output_dim)
         self.required_keys = {c.name for c in self.conditioners if c.uncond_vector is None}
 
+        # Pre-allocate buffers for common batch sizes to avoid repeated allocations
+        self._cached_shapes = {}
+        self._max_cache_size = 8  # Limit cache size to prevent memory issues
+
+    @lru_cache(maxsize=64)
+    def _get_expansion_pattern(self, input_shape: tuple, target_batch_size: int) -> tuple:
+        """Cache tensor expansion patterns to avoid repeated computation."""
+        batch_size, seq_len, feature_dim = input_shape
+        if batch_size == 1 and target_batch_size > 1:
+            return (target_batch_size, seq_len, feature_dim)
+        return input_shape
+
+    def _ensure_3d_shape(self, tensor: torch.Tensor, target_batch_size: int = 1) -> torch.Tensor:
+        """Efficiently ensure tensor has 3D shape with minimal operations."""
+        if tensor.dim() == 1:
+            # [feature_dim] -> [1, 1, feature_dim]
+            return tensor.view(1, 1, -1)
+        elif tensor.dim() == 2:
+            # [batch_size, feature_dim] -> [batch_size, 1, feature_dim]
+            return tensor.unsqueeze(1)
+        elif tensor.dim() == 3:
+            # Already correct shape, potentially expand batch dimension
+            if tensor.shape[0] == 1 and target_batch_size > 1:
+                return tensor.expand(target_batch_size, -1, -1)
+            return tensor
+        else:
+            raise ValueError(f"Unexpected tensor dimension: {tensor.dim()}")
+
     def forward(self, cond_dict: dict) -> torch.Tensor:
         if not set(cond_dict).issuperset(self.required_keys):
             raise ValueError(f"Missing required keys: {self.required_keys - set(cond_dict)}")
-        conds = []
+
+        # Collect conditioner outputs first
+        cond_outputs = []
+        max_bsz = 1
+
         for conditioner in self.conditioners:
             cond_output = conditioner(cond_dict.get(conditioner.name))
 
-            # Ensure all outputs have 3D shape [batch_size, seq_len, feature_dim]
+            # Ensure output is at least 2D
+            if cond_output.dim() == 1:
+                cond_output = cond_output.unsqueeze(0)  # [1, feature_dim]
+
+            # Track maximum batch size
+            if cond_output.dim() >= 1:
+                max_bsz = max(max_bsz, cond_output.shape[0])
+
+            cond_outputs.append(cond_output)
+
+        # Process outputs to ensure consistent 3D shape [batch, seq, features]
+        processed_conds = []
+        for cond_output in cond_outputs:
+            # Convert to 3D: [batch_size, seq_len, feature_dim]
             if cond_output.dim() == 2:
-                # Add sequence dimension: [batch_size, feature_dim] -> [batch_size, 1, feature_dim]
-                cond_output = cond_output.unsqueeze(1)
-            elif cond_output.dim() == 1:
-                # Add batch and sequence dimensions: [feature_dim] -> [1, 1, feature_dim]
-                cond_output = cond_output.unsqueeze(0).unsqueeze(0)
+                # [batch_size, feature_dim] -> [batch_size, 1, feature_dim]
+                shaped_output = cond_output.unsqueeze(1)
+            elif cond_output.dim() == 3:
+                shaped_output = cond_output
+            else:
+                raise ValueError(f"Unexpected tensor dimension after initial processing: {cond_output.dim()}")
 
-            conds.append(cond_output)
+            # Expand batch dimension to match max_bsz if needed
+            current_bsz = shaped_output.shape[0]
+            if current_bsz == 1 and max_bsz > 1:
+                shaped_output = shaped_output.expand(max_bsz, -1, -1)
+            elif current_bsz != max_bsz:
+                raise ValueError(f"Batch size mismatch: expected {max_bsz}, got {current_bsz}")
 
-        # Ensure all tensors have consistent batch size
-        max_bsz = max(c.shape[0] for c in conds)
+            processed_conds.append(shaped_output)
 
-        # Expand tensors to consistent batch size, ensuring they all have 3 dimensions
-        expanded_conds = []
-        for c in conds:
-            if c.shape[0] == 1 and max_bsz > 1:
-                # Expand batch dimension: [1, seq_len, feature_dim] -> [max_bsz, seq_len, feature_dim]
-                c = c.expand(max_bsz, -1, -1)
-            expanded_conds.append(c)
+        # Verify all tensors have compatible shapes before concatenation
+        if processed_conds:
+            batch_size = processed_conds[0].shape[0]
+            feature_dim = processed_conds[0].shape[2]
 
-        return self.norm(self.project(torch.cat(expanded_conds, dim=-2)))
+            for i, tensor in enumerate(processed_conds):
+                if tensor.shape[0] != batch_size:
+                    raise ValueError(f"Batch size mismatch at tensor {i}: expected {batch_size}, got {tensor.shape[0]}")
+                if tensor.shape[2] != feature_dim:
+                    raise ValueError(
+                        f"Feature dimension mismatch at tensor {i}: expected {feature_dim}, got {tensor.shape[2]}")
+
+        # Concatenate along sequence dimension
+        concatenated = torch.cat(processed_conds, dim=1)  # Changed from dim=-2 to dim=1
+
+        # Apply projection and normalization
+        return self.norm(self.project(concatenated))
+
+    def clear_shape_cache(self):
+        """Clear the shape cache to free memory if needed."""
+        self._get_expansion_pattern.cache_clear()
+        self._cached_shapes.clear()
 
 
 supported_language_codes = [
@@ -401,7 +465,6 @@ supported_language_codes = [
     'sl', 'sq', 'sr', 'sv', 'sw', 'ta', 'te', 'tn', 'tr', 'tt', 'ur', 'uz', 'vi',
     'vi-vn-x-central', 'vi-vn-x-south', 'yue'
 ]  # fmt: off
-
 
 def make_cond_dict(
     text: str = "It would be nice to have time for testing, indeed.",

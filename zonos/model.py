@@ -5,7 +5,9 @@ import safetensors
 import torch
 import torch.nn as nn
 from huggingface_hub import hf_hub_download
-
+from functools import lru_cache
+import hashlib
+import pickle
 from zonos.autoencoder import DACAutoencoder
 from zonos.backbone import BACKBONES
 from zonos.codebook_pattern import apply_delay_pattern, revert_delay_pattern
@@ -57,8 +59,8 @@ class Zonos(nn.Module):
     def from_pretrained(
         cls, repo_id: str, revision: str | None = None, device: str = DEFAULT_DEVICE, **kwargs
     ) -> "Zonos":
-        config_path = hf_hub_download(repo_id=repo_id, filename="config.json", revision=revision)
-        model_path = hf_hub_download(repo_id=repo_id, filename="model.safetensors", revision=revision)
+        config_path = hf_hub_download(repo_id=repo_id, filename="config.json", revision=revision, local_dir_use_symlinks=False)
+        model_path = hf_hub_download(repo_id=repo_id, filename="model.safetensors", revision=revision, local_dir_use_symlinks=False)
         return cls.from_local(config_path, model_path, device, **kwargs)
 
     @classmethod
@@ -200,15 +202,75 @@ class Zonos(nn.Module):
         lengths_per_sample = torch.full((batch_size,), 0, dtype=torch.int32)
         return InferenceParams(max_seqlen, batch_size, 0, 0, key_value_memory_dict, lengths_per_sample)
 
-    def prepare_conditioning(self, cond_dict: dict, uncond_dict: dict | None = None) -> torch.Tensor:
-        if uncond_dict is None:
-            uncond_dict = {k: cond_dict[k] for k in self.prefix_conditioner.required_keys}
-        return torch.cat(
-            [
+    def _create_conditioning_cache_key(self, cond_dict: dict, uncond_dict: dict) -> str:
+        """Create a deterministic cache key from conditioning dictionaries with mixed types."""
+
+        def value_to_key(value):
+            if value is None:
+                return "None"
+            elif isinstance(value, torch.Tensor):
+                # Handle tensors
+                 tensor_bytes = value.cpu().float().numpy().tobytes()
+                 return f"tensor_{value.shape}_{value.dtype}_{hash(tensor_bytes)}"
+            elif isinstance(value, (int, float)):
+                return f"num_{value}"
+            elif isinstance(value, str):
+                return f"str_{value}"
+            elif isinstance(value, bool):
+                return f"bool_{value}"
+            elif isinstance(value, (list, tuple)):
+                # Handle lists/tuples by recursively processing elements
+                return f"list_{[value_to_key(item) for item in value]}"
+            else:
+                # Fallback for other types
+                return f"other_{type(value).__name__}_{str(value)}"
+
+        # Create keys for both dictionaries
+        cond_items = sorted((k, value_to_key(v)) for k, v in cond_dict.items())
+        uncond_items = None if uncond_dict is None else sorted((k, value_to_key(v)) for k, v in uncond_dict.items())
+
+        cache_string = f"cond:{cond_items}_uncond:{uncond_items}"
+        return hashlib.sha512(cache_string.encode()).hexdigest()
+
+    def prepare_conditioning(self, cond_dict: dict, uncond_dict: dict | None = None, use_cache: bool = True) -> torch.Tensor:
+        if not use_cache:
+            # Original implementation
+            if uncond_dict is None:
+                uncond_dict = {k: cond_dict[k] for k in self.prefix_conditioner.required_keys}
+            return torch.cat([
                 self.prefix_conditioner(cond_dict),
                 self.prefix_conditioner(uncond_dict),
-            ]
-        )
+            ])
+
+        # Create cache key from conditioning dictionaries
+        cache_key = self._create_conditioning_cache_key(cond_dict, uncond_dict)
+
+        # Check if we have a cached result
+        if hasattr(self, '_conditioning_cache') and cache_key in self._conditioning_cache:
+            return self._conditioning_cache[cache_key].clone()
+
+        # Compute conditioning
+        if uncond_dict is None:
+            uncond_dict = {k: cond_dict[k] for k in self.prefix_conditioner.required_keys}
+        conditioning = torch.cat([
+            self.prefix_conditioner(cond_dict),
+            self.prefix_conditioner(uncond_dict),
+        ])
+
+        # Cache the result
+        if not hasattr(self, '_conditioning_cache'):
+            self._conditioning_cache = {}
+
+        # Limit cache size to prevent memory issues
+        if len(self._conditioning_cache) >= 32:
+            # Remove oldest entry
+            oldest_key = next(iter(self._conditioning_cache))
+            del self._conditioning_cache[oldest_key]
+
+        self._conditioning_cache[cache_key] = conditioning.clone()
+        return conditioning
+
+
 
     def can_use_cudagraphs(self) -> bool:
         # Only the mamba-ssm backbone supports CUDA Graphs at the moment

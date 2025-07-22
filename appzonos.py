@@ -34,6 +34,12 @@ from zonos.utils import DEFAULT_DEVICE as device
 # =============================================================================
 # GLOBAL CONFIGURATION AND CONSTANTS
 # =============================================================================
+# Fix torch.compile C++ compilation issues on Windows
+if sys.platform == "win32":
+    os.environ["TORCH_COMPILE_CPP_FORCE_X64"] = "1"
+    # Alternative approach - force specific compiler architecture
+    os.environ["DISTUTILS_USE_SDK"] = "1"
+    os.environ["MSSdk"] = "1"
 
 # Platform-specific defaults
 de_disable_torch_compile_default = False
@@ -86,7 +92,7 @@ cpu = torch.device('cpu')
 try:
     gpu = get_gpu_device()
 except RuntimeError as e:
-    print(f"GPU initialization failed: {e}")
+    logging.error(f"GPU initialization failed: {e}")
     gpu = None
 
 # =============================================================================
@@ -211,7 +217,7 @@ def generate_audio(model_choice, text, language, speaker_audio, prefix_audio, e1
     """
     Generates audio based on the provided UI parameters with enhanced caching.
     """
-    print(f"inputs: model_choice={model_choice}, text={text}, language={language}, speaker_audio={speaker_audio}, seed={seed}")
+    logging.info(f"inputs: model_choice={model_choice}, text={text}, language={language}, speaker_audio={speaker_audio}, seed={seed}")
     # Start timing the entire function
     func_start_time = time.perf_counter()
 
