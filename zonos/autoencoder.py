@@ -1,9 +1,9 @@
 import math
 
+import numpy as np
 import torch
 import torchaudio
 from transformers.models.dac import DacModel
-
 
 class DACAutoencoder:
     def __init__(self):
@@ -16,8 +16,8 @@ class DACAutoencoder:
 
     def preprocess(self, wav: torch.Tensor, sr: int) -> torch.Tensor:
         wav = torchaudio.functional.resample(wav, sr, 44_100)
-        right_pad = math.ceil(wav.shape[-1] / 512) * 512 - wav.shape[-1]
-        return torch.nn.functional.pad(wav, (0, right_pad))
+        left_pad = math.ceil(wav.shape[-1] / 512) * 512 - wav.shape[-1]
+        return torch.nn.functional.pad(wav, (left_pad, 0), value=0)
 
     def encode(self, wav: torch.Tensor) -> torch.Tensor:
         return self.dac.encode(wav).audio_codes
@@ -25,3 +25,12 @@ class DACAutoencoder:
     def decode(self, codes: torch.Tensor) -> torch.Tensor:
         with torch.autocast(self.dac.device.type, torch.float16, enabled=self.dac.device.type != "cpu"):
             return self.dac.decode(audio_codes=codes).audio_values.unsqueeze(1).float()
+
+    def decode_to_int16(self, codes: torch.Tensor) -> np.ndarray:
+        device = self.dac.device
+        codes = codes.to(device)
+
+        with torch.autocast(self.dac.device.type, dtype=torch.float16, enabled=self.dac.device.type != "cpu"):
+            audio_values = self.dac.decode(audio_codes=codes).audio_values
+            audio_int16 = (audio_values.clamp(-1.0, 1.0) * 32767.0).to(torch.int16)
+            return audio_int16.squeeze(0).unsqueeze(1)

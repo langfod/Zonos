@@ -1,3 +1,4 @@
+import functools
 from functools import cache
 from typing import Any, Literal, Iterable
 
@@ -61,7 +62,6 @@ import inflect
 import torch
 import torch.nn as nn
 from kanjize import number2kanji
-from phonemizer.backend import EspeakBackend
 from sudachipy import Dictionary, SplitMode
 
 if sys.platform == "darwin":
@@ -338,11 +338,17 @@ supported_language_codes = [
     'vi-vn-x-central', 'vi-vn-x-south', 'yue'
 ]  # fmt: off
 
+@functools.lru_cache(maxsize=128)
+def _get_language_id(language: str) -> int:
+    language_code_to_id = {lang: i for i, lang in enumerate(supported_language_codes)}
+    language_id = language_code_to_id.get(language.lower(), -1)
+    assert language_id != -1, f"Unsupported language: {language}. Please pick from {supported_language_codes}"
+    return language_id
 
 def make_cond_dict(
     text: str = "It would be nice to have time for testing, indeed.",
     language: str = "en-us",
-    speaker: torch.Tensor | None = None,
+    speaker: torch.Tensor = None,
     
     # Emotion vector from 0.0 to 1.0
     #   Is entangled with pitch_std because more emotion => more pitch variation
@@ -384,10 +390,6 @@ def make_cond_dict(
     A helper to build the 'cond_dict' that the model expects.
     By default, it will generate a random speaker embedding
     """
-    assert language.lower() in supported_language_codes, "Please pick a supported language"
-
-    language_code_to_id = {lang: i for i, lang in enumerate(supported_language_codes)}
-
     cond_dict = {
         "espeak": ([text], [language]),
         "speaker": speaker,
@@ -395,7 +397,7 @@ def make_cond_dict(
         "fmax": fmax,
         "pitch_std": pitch_std,
         "speaking_rate": speaking_rate,
-        "language_id": language_code_to_id[language],
+        "language_id": _get_language_id(language),
         "vqscore_8": vqscore_8,
         "ctc_loss": ctc_loss,
         "dnsmos_ovrl": dnsmos_ovrl,

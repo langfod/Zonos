@@ -24,7 +24,7 @@ echo " # and close them when they complete.                                     
 echo " #                                                                                                       #  "
 echo " #########################################################################################################  "
 
-
+  
 
 echo ###
 echo # Checking if eSpeak-NG.eSpeak-NG is installed...
@@ -42,11 +42,10 @@ del %tempFile%
 
 
 echo ###
-REM echo # Not trusting the Microsoft.VisualStudio.2022.BuildTools so uninstalling and reinstalling with x64
-echo # Checking if Microsoft.VisualStudio.2022.BuildTools is installed (should be x64 but cannot check...
+echo # Not trusting the Microsoft.VisualStudio.2022.BuildTools so uninstalling and reinstalling with x64
+REM echo # Checking if Microsoft.VisualStudio.2022.BuildTools is installed (should be x64 but cannot check...
 echo ###
-REM This would uninstall Visual Studio Build Tools 2022 if it was installed, but we are not doing that now.
-REM winget uninstall --id Microsoft.VisualStudio.2022.BuildTools
+winget uninstall --id Microsoft.VisualStudio.2022.BuildTools
 winget list --id Microsoft.VisualStudio.2022.BuildTools > "%tempFile%"
 
 findstr /i /c:Microsoft.VisualStudio.2022.BuildTools "%tempFile%" >nul

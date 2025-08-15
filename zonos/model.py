@@ -1,4 +1,5 @@
 import json
+import logging
 from typing import Callable
 
 import safetensors
@@ -30,6 +31,7 @@ class Zonos(nn.Module):
         self.backbone = backbone_cls(config.backbone)
         self.prefix_conditioner = PrefixConditioner(config.prefix_conditioner, dim)
         self.spk_clone_model = None
+        self._persistent_spk_model = None
 
         # TODO: pad to multiple of at least 8
         self.embeddings = nn.ModuleList([nn.Embedding(1026, dim) for _ in range(self.autoencoder.num_codebooks)])
@@ -57,8 +59,8 @@ class Zonos(nn.Module):
     def from_pretrained(
         cls, repo_id: str, revision: str | None = None, device: str = DEFAULT_DEVICE, **kwargs
     ) -> "Zonos":
-        config_path = hf_hub_download(repo_id=repo_id, filename="config.json", revision=revision)
-        model_path = hf_hub_download(repo_id=repo_id, filename="model.safetensors", revision=revision)
+        config_path = hf_hub_download(repo_id=repo_id, filename="config.json", revision=revision, local_dir_use_symlinks=False )
+        model_path = hf_hub_download(repo_id=repo_id, filename="model.safetensors", revision=revision, local_dir_use_symlinks=False)
         return cls.from_local(config_path, model_path, device, **kwargs)
 
     @classmethod
@@ -87,14 +89,22 @@ class Zonos(nn.Module):
         return model
 
     def make_speaker_embedding(self, wav: torch.Tensor, sr: int) -> torch.Tensor:
-        """Generate a speaker embedding from an audio clip."""
-        if self.spk_clone_model is None:
-            self.spk_clone_model = SpeakerEmbeddingLDA()
-        _, spk_embedding = self.spk_clone_model(wav.to(self.spk_clone_model.device), sr)
+        """Generate a speaker embedding with persistent model."""
+        if self._persistent_spk_model is None:
+            self._persistent_spk_model = SpeakerEmbeddingLDA(device=self.device)
+
+        _, spk_embedding = self._persistent_spk_model(wav, sr)
         return spk_embedding.unsqueeze(0).bfloat16()
 
     def embed_codes(self, codes: torch.Tensor) -> torch.Tensor:
-        return sum(emb(codes[:, i]) for i, emb in enumerate(self.embeddings))
+        # Pre-allocate and accumulate
+        out = None
+        for i, emb in enumerate(self.embeddings):
+            if out is None:
+                out = emb(codes[:, i])
+            else:
+                out += emb(codes[:, i])
+        return out
 
     def apply_heads(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return torch.stack([head(hidden_states) for head in self.heads], dim=1)
@@ -218,7 +228,7 @@ class Zonos(nn.Module):
     def generate(
         self,
         prefix_conditioning: torch.Tensor,  # [bsz, cond_seq_len, d_model]
-        audio_prefix_codes: torch.Tensor | None = None,  # [bsz, 9, prefix_audio_seq_len]
+        audio_prefix_codes: torch.Tensor = None,  # [bsz, 9, prefix_audio_seq_len]
         max_new_tokens: int = 86 * 30,
         cfg_scale: float = 2.0,
         batch_size: int = 1,
@@ -247,14 +257,16 @@ class Zonos(nn.Module):
             codes[..., :prefix_audio_len] = audio_prefix_codes
 
         delayed_codes = apply_delay_pattern(codes, self.masked_token_id)
-
         delayed_prefix_audio_codes = delayed_codes[..., : prefix_audio_len + 1]
 
+        # Initial prefill
         logits = self._prefill(prefix_conditioning, delayed_prefix_audio_codes, inference_params, cfg_scale)
+
+        # Use original tensor indexing that was working
         next_token = sample_from_logits(logits, **sampling_params)
 
         offset = delayed_prefix_audio_codes.shape[2]
-        frame = delayed_codes[..., offset : offset + 1]
+        frame = delayed_codes[..., offset: offset + 1]
         frame.masked_scatter_(frame == unknown_token, next_token)
 
         prefix_length = prefix_conditioning.shape[1] + prefix_audio_len + 1
@@ -262,49 +274,66 @@ class Zonos(nn.Module):
         inference_params.lengths_per_sample[:] += prefix_length
 
         logit_bias = torch.zeros_like(logits)
-        logit_bias[:, 1:, self.eos_token_id] = -torch.inf  # only allow codebook 0 to predict EOS
+        logit_bias[:, 1:, self.eos_token_id] = -torch.inf
 
         stopping = torch.zeros(batch_size, dtype=torch.bool, device=device)
         max_steps = delayed_codes.shape[2] - offset
         remaining_steps = torch.full((batch_size,), max_steps, device=device)
-        cfg_scale = torch.tensor(cfg_scale)
+        cfg_scale_tensor = torch.tensor(cfg_scale)
 
         step = 0
         while torch.max(remaining_steps) > 0:
             offset += 1
-            input_ids = delayed_codes[..., offset - 1 : offset]
-            logits = decode_one_token(input_ids, inference_params, cfg_scale, allow_cudagraphs=cg)
+
+            # Add bounds check to prevent empty tensor slicing
+            if offset >= delayed_codes.shape[2]:
+                break
+
+            input_ids = delayed_codes[..., offset - 1: offset]
+
+            logits = decode_one_token(input_ids, inference_params, cfg_scale_tensor)
             logits += logit_bias
 
             next_token = sample_from_logits(logits, generated_tokens=delayed_codes[..., :offset], **sampling_params)
             eos_in_cb0 = next_token[:, 0] == self.eos_token_id
 
-            remaining_steps[eos_in_cb0[:, 0]] = torch.minimum(remaining_steps[eos_in_cb0[:, 0]], torch.tensor(9))
+            remaining_steps[eos_in_cb0[:, 0]] = torch.minimum(
+                remaining_steps[eos_in_cb0[:, 0]], torch.tensor(9, device=device)
+            )
             stopping |= eos_in_cb0[:, 0]
 
             eos_codebook_idx = 9 - remaining_steps
             eos_codebook_idx = torch.clamp(eos_codebook_idx, max=9 - 1)
-            for i in range(next_token.shape[0]):
+            for i in range(batch_size):
                 if stopping[i]:
                     idx = eos_codebook_idx[i].item()
                     next_token[i, :idx] = self.masked_token_id
                     next_token[i, idx] = self.eos_token_id
 
-            frame = delayed_codes[..., offset : offset + 1]
-            frame.masked_scatter_(frame == unknown_token, next_token)
+            # Add another bounds check before accessing frame
+            if offset < delayed_codes.shape[2]:
+                frame = delayed_codes[..., offset: offset + 1]
+                # Ensure frame is not empty before reshaping
+                if frame.numel() > 0:
+                    mask = (frame == unknown_token).view(batch_size, 9)
+                    frame.view(batch_size, 9).masked_scatter_(mask, next_token)
+
             inference_params.seqlen_offset += 1
             inference_params.lengths_per_sample[:] += 1
-
             remaining_steps -= 1
 
             step += 1
 
-            if callback is not None and not callback(frame, step, max_steps):
+            if callback is not None and not callback(
+                    frame if 'frame' in locals() and frame.numel() > 0 else torch.empty(0), step, max_steps):
                 break
 
         out_codes = revert_delay_pattern(delayed_codes)
         out_codes.masked_fill_(out_codes >= 1024, 0)
         out_codes = out_codes[..., : offset - 9]
+
+        actual_new_tokens = offset - (prefix_audio_len + 1)
+        logging.info(f"Max Token: {max_new_tokens}. Actual decoded tokens (excluding prompt): {actual_new_tokens}")
 
         self._cg_graph = None  # reset cuda graph to avoid cache changes
 

@@ -8,49 +8,46 @@ from typing import Optional
 from zonos.model import Zonos
 from utilities.config_utils import is_online_model
 
+CURRENT_MODEL_TYPE: Optional[str] = None
+CURRENT_MODEL: Optional[Zonos] = None
 
-def load_model_if_needed(model_choice: str, current_model_type: Optional[str],
-                        current_model: Optional[Zonos], device: torch.device,
-                        needed_models: set) -> tuple[Zonos, str]:
-    """
-    Load model if needed, with caching to avoid reloading the same model.
+def load_model_if_needed(model_choice: str,
+                        device: torch.device,
+                        needed_models: set, disable_torch_compile:bool = False) -> Zonos:
 
-    Returns:
-        tuple: (loaded_model, model_type)
-    """
-    if current_model_type != model_choice:
-        if current_model is not None:
-            del current_model
+    global CURRENT_MODEL_TYPE, CURRENT_MODEL
+
+    if CURRENT_MODEL_TYPE != model_choice:
+        logging.info(f"Model type changed from {CURRENT_MODEL_TYPE} to {model_choice}. Reloading model...")
+        if CURRENT_MODEL is not None:
+            del CURRENT_MODEL
             torch.cuda.empty_cache()
 
-        print(f"Loading {model_choice} model...")
         logging.info(f"Loading {model_choice} model...")
 
         if is_online_model(model_choice, needed_models):
-            model = Zonos.from_pretrained(model_choice, device=device)
+            model = Zonos.from_pretrained(model_choice, device=device.type)
         else:
             config_path = f"{model_choice}{os.sep}config.json"
             model_path = f"{model_choice}{os.sep}model.safetensors"
-            model = Zonos.from_local(config_path, model_path, device=device)
+            model = Zonos.from_local(config_path, model_path, device=device.type)
 
         model.requires_grad_(False).eval()
 
-        # Optimization: compile autoencoder decoder
-        logging.info("Compiling the autoencoder decoder for faster waveform generation...")
-        try:
-            model.autoencoder.decode = torch.compile(
-                model.autoencoder.decode, mode="reduce-overhead", fullgraph=True
-            )
-            logging.info("Decoder compiled successfully!")
-        except Exception as e:
-            logging.info(f"Warning: Could not compile the autoencoder decoder. It will run unoptimized. Error: {e}")
+        if not disable_torch_compile:
+            try:
+                model.autoencoder.decode = torch.compile(
+                    model.autoencoder.decode, fullgraph=True
+                )
+            except Exception as e:
+                logging.info(f"Warning: Could not compile the autoencoder decoder. It will run unoptimized. Error: {e}")
 
-        logging.info(f"{model_choice} model loaded successfully!")
-        print(f"{model_choice} model loaded successfully!")
+            logging.info(f"{model_choice} model loaded successfully!")
 
-        return model, model_choice
+        CURRENT_MODEL = model
+        CURRENT_MODEL_TYPE = model_choice
 
-    return current_model, current_model_type
+    return CURRENT_MODEL
 
 
 def get_supported_models(backbone_cls, ai_model_dir_hy: str, ai_model_dir_tf: str) -> list[str]:

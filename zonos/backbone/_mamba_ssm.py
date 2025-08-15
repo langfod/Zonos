@@ -5,7 +5,6 @@ from mamba_ssm.ops.triton.layer_norm import layer_norm_fn
 
 from zonos.config import BackboneConfig, InferenceParams
 
-
 class MambaSSMZonosBackbone(nn.Module):
     supported_architectures = ["transformer", "hybrid"]
 

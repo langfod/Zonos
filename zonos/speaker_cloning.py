@@ -27,12 +27,16 @@ class logFbankCal(nn.Module):
             hop_length=int(hop_length * sample_rate),
             n_mels=n_mels,
         )
+        # Pre-compute for efficiency
+        self.register_buffer('eps', torch.tensor(1e-6))
 
     def forward(self, x):
         out = self.fbankCal(x)
-        out = torch.log(out + 1e-6)
-        out = out - out.mean(axis=2).unsqueeze(dim=2)
-        return out
+        # More memory-efficient computation
+        out = torch.log(out + self.eps)
+        # One-line mean subtraction
+        mean = out.mean(dim=2, keepdim=True)
+        return out - mean
 
 
 class ASP(nn.Module):
@@ -354,15 +358,23 @@ class ECAPA_TDNN(nn.Module):
 
 
 class SpeakerEmbedding(nn.Module):
-    def __init__(self, ckpt_path: str = "ResNet293_SimAM_ASP_base.pt", device: str = DEFAULT_DEVICE):
+    def __init__(self, ckpt_path: str = "ResNet293_SimAM_ASP_base.pt", device: torch.device = DEFAULT_DEVICE):
         super().__init__()
-        self.device = device
-        with torch.device(device):
-            self.model = ResNet293_based()
-            state_dict = torch.load(ckpt_path, weights_only=True, mmap=True, map_location="cpu")
-            self.model.load_state_dict(state_dict)
-            self.model.featCal = logFbankCal()
+        self.device = torch.device(device)
 
+        # Load model directly to target device
+        self.model = ResNet293_based()
+        state_dict = torch.load(
+            ckpt_path,
+            weights_only=True,
+            mmap=True,
+            map_location=self.device  # Direct load to target device
+        )
+        self.model.load_state_dict(state_dict)
+        self.model.featCal = logFbankCal().to(self.device)  # Move fbankCal to device
+
+        # Ensure entire model is on target device
+        self.model = self.model.to(self.device)
         self.requires_grad_(False).eval()
 
     @property
@@ -381,12 +393,23 @@ class SpeakerEmbedding(nn.Module):
         return wav
 
     def forward(self, wav: torch.Tensor, sample_rate: int):
-        wav = self.prepare_input(wav, sample_rate).to(self.device, self.dtype)
-        return self.model(wav).to(wav.device)
+        # Ensure wav is already on correct device to avoid transfers
+        if wav.device != self.device:
+            wav = wav.to(self.device)
+
+        wav = self.prepare_input(wav, sample_rate)
+        # Ensure correct dtype but avoid unnecessary transfers
+        if wav.dtype != self.dtype:
+            wav = wav.to(self.dtype)
+
+        out = self.model(wav)
+
+        # Return tensor on the same device as input to minimize device transfers downstream
+        return out  # Already on self.device
 
 
 class SpeakerEmbeddingLDA(nn.Module):
-    def __init__(self, device: str = DEFAULT_DEVICE):
+    def __init__(self, device: torch.device = DEFAULT_DEVICE):
         super().__init__()
         spk_model_path = hf_hub_download(
             repo_id="Zyphra/Zonos-v0.1-speaker-embedding",
@@ -397,16 +420,28 @@ class SpeakerEmbeddingLDA(nn.Module):
             filename="ResNet293_SimAM_ASP_base_LDA-128.pt",
         )
 
-        self.device = device
-        with torch.device(device):
-            self.model = SpeakerEmbedding(spk_model_path, device)
-            lda_sd = torch.load(lda_spk_model_path, weights_only=True)
-            out_features, in_features = lda_sd["weight"].shape
-            self.lda = nn.Linear(in_features, out_features, bias=True, dtype=torch.float32)
-            self.lda.load_state_dict(lda_sd)
+        self.device = torch.device(device)
+
+        # Load both models directly to target device
+        self.model = SpeakerEmbedding(spk_model_path, device)
+        lda_sd = torch.load(lda_spk_model_path, weights_only=True, map_location=self.device)
+        out_features, in_features = lda_sd["weight"].shape
+        self.lda = nn.Linear(in_features, out_features, bias=True, dtype=torch.float32).to(self.device)
+        self.lda.load_state_dict(lda_sd)
 
         self.requires_grad_(False).eval()
 
     def forward(self, wav: torch.Tensor, sample_rate: int):
-        emb = self.model(wav, sample_rate).to(torch.float32)
-        return emb, self.lda(emb)
+        # Ensure input is on correct device once
+        if wav.device != self.device:
+            wav = wav.to(self.device)
+
+        emb = self.model(wav, sample_rate)
+        # Ensure correct dtype for LDA, transfer if needed
+        if emb.dtype != torch.float32:
+            emb = emb.to(torch.float32)
+
+        lda_emb = self.lda(emb)
+
+        # Return on same device
+        return emb, lda_emb

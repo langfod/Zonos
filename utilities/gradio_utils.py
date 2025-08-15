@@ -5,12 +5,11 @@ import gradio as gr
 from typing import List
 
 
-def update_ui_visibility(model, cond_names: List[str]):
+def update_ui_visibility(cond_names: List[str]):
     """
     Dynamically show/hide UI elements based on the model's conditioners.
     We do NOT display 'language_id' or 'ctc_loss' even if they exist in the model.
     """
-    print("Conditioners in this model:", cond_names)
 
     text_update = gr.update(visible=("espeak" in cond_names))
     language_update = gr.update(visible=("espeak" in cond_names))

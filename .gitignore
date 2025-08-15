@@ -14,3 +14,6 @@ wheels/
 /.env_win
 /.idea
 /models
+/.continue
+/cache
+/output_temp
