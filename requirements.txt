@@ -1,11 +1,7 @@
-#Core-Zonos
 #PYTORCH*********************************************************************
-
 --extra-index-url=https://download.pytorch.org/whl/cu129 ; sys_platform  != 'darwin'
 torch<2.9
 torchaudio
-
-
 
 #TRITON*************************************
 #https://github.com/woct0rdho/triton-windows/releases/download/empty/triton-3.3.0-py3-none-any.whl ; sys_platform == 'win32' #egg:3.3.0
@@ -13,22 +9,14 @@ triton-windows; sys_platform == 'win32' # tw
 
 
 #FLASH ATTENTION****************************
-https://github.com/loscrossos/lib_flashattention/releases/download/v2.8.0/flash_attn-2.8.0+cu129torch2.7.1-cp312-cp312-linux_x86_64.whl ; sys_platform == 'linux' #egg:v2.7.4.post1
-https://github.com/loscrossos/lib_flashattention/releases/download/v2.8.0/flash_attn-2.8.0+cu129torch2.7.1-cp312-cp312-win_amd64.whl ; sys_platform == 'win32' #egg:v2.7.4.post1
-
-
-
-
+https://github.com/langfod/flash-attention/releases/download/v2.8.3w/flash_attn-2.8.3-cp312-cp312-win_amd64.whl
 
 #causal conv1d******************************
-https://github.com/loscrossos/lib_causal-conv1d/releases/download/v1.5.0.post8_crossos00/causal_conv1d-1.5.0.post8+cu129torch2.7.1-cp312-cp312-win_amd64.whl  ; sys_platform == 'win32' #egg:v1.5.0.post8
-
+https://github.com/langfod/causal-conv1d/releases/download/v1.5.2/causal_conv1d-1.5.2-cp312-cp312-win_amd64.whl  ; sys_platform == 'win32' #egg:v1.5.0.post8
 
 
 #mamba**************************************
-https://github.com/loscrossos/lib_mamba/releases/download/v2.2.4_crossos00/mamba_ssm-2.2.4+cu129torch2.7.1-cp312-cp312-win_amd64.whl ; sys_platform == 'win32' #egg:v2.2.4
-
-
+https://github.com/langfod/mamba/releases/download/v2.2.5/mamba_ssm-2.2.5-cp312-cp312-win_amd64.whl ; sys_platform == 'win32' #egg:v2.2.4
 
 
 packaging
@@ -36,7 +24,6 @@ setuptools<81.0
 
 
 wheel
-nvidia-cuda-runtime-cu12
 inflect>=7.5.0
 kanjize>=1.5.0
 numpy>=2.2.2
@@ -52,3 +39,5 @@ gradio>=5.15.0
 dotenv
 psutil
 pyinstaller
+loguru
+scipy
