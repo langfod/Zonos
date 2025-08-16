@@ -22,6 +22,7 @@ from scipy.io.wavfile import write
 import numpy as np
 import torch
 from loguru import logger
+import torchaudio
 from utilities.cache_utils import save_torchaudio_wav
 # Local imports - utilities
 from utilities.config_utils import (update_model_paths_file, parse_model_paths_file)
@@ -345,8 +346,8 @@ async def generate_audio(model_choice, text, language, speaker_audio, prefix_aud
     # Log execution time
     func_end_time = perf_counter_ns()
     total_duration_s = (func_end_time - func_start_time)  / 1_000_000_000  # Convert nanoseconds to seconds
-    wav_length = wav_np.shape[-1]   / selected_model.autoencoder.sampling_rate
-    #wav_length = len(wav_np) / selected_model.autoencoder.sampling_rate
+    #wav_length = wav_np.shape[-1]   / selected_model.autoencoder.sampling_rate
+    wav_length = len(wav_np) / selected_model.autoencoder.sampling_rate
     logging.info(f"Total 'generate_audio' for {speaker_audio} execution time: {total_duration_s:.2f} seconds")
     logging.info(f"Generated audio length: {wav_length:.2f} seconds {selected_model.autoencoder.sampling_rate}. Speed: {wav_length / total_duration_s:.2f}x")
     stdout.flush()
@@ -410,12 +411,15 @@ if __name__ == "__main__":
     try:
         # Run twice to warm model and caches
         [sampling_rate, wav_numpy], seed_int = test_generate_audio(model_choice=modelchoice,text=test_text,speaker_audio=test_asset,seed=42)
+        write("test_audio_output1.wav", sampling_rate, wav_numpy.cpu().numpy())
+
+        [sampling_rate, wav_numpy], seed_int = test_generate_audio(model_choice=modelchoice,text=test_text,speaker_audio=test_asset,seed=42)
         # Reset for next run
         #sampling_rate, wav_numpy, seed_int = None,  None , 0
         #[sampling_rate, wav_numpy], seed_int = test_generate_audio(model_choice=modelchoice,text=test_text,speaker_audio=test_asset,seed=42,profiling=True)
 
         print(f"Generated audio with sampling rate: {sampling_rate}, seed: {seed_int}")
-        write("test_audio_output.wav", sampling_rate, wav_numpy.cpu().numpy())
+        write("test_audio_output2.wav", sampling_rate, wav_numpy.cpu().numpy())
         #np.save("test_audio_output",wav_numpy)
     except Exception as e:
         print(traceback.format_exc())

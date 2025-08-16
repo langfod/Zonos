@@ -11,7 +11,6 @@ from typing import Dict
 import psutil
 import torch
 import torchaudio
-import soundfile as sf
 
 _cache_lock = threading.Lock()
 # Global cache for audio prefixes

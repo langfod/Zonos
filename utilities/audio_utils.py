@@ -67,7 +67,7 @@ async def process_prefix_audio(prefix_audio_path: str, model, device: torch.devi
         audio_prefix_codes = load_from_disk(prefix_audio_cache_key, "prefix", device=device)
         if audio_prefix_codes is not None:
             logging.info(f"Loaded prefix audio for {prefix_audio_cache_key} from disk cache")
-            SPEAKER_CACHE[prefix_audio_cache_key] = audio_prefix_codes
+            PREFIX_AUDIO_CACHE[prefix_audio_cache_key] = audio_prefix_codes.clone()
             return audio_prefix_codes
         else:
             logging.info(f"Prefix embedding for {prefix_audio_cache_key} not found in disk cache, computing new embedding")
@@ -79,7 +79,7 @@ async def process_prefix_audio(prefix_audio_path: str, model, device: torch.devi
     wav_prefix = model.autoencoder.preprocess(wav_prefix, sr_prefix)
     wav_prefix = wav_prefix.to(dtype=torch.float32)
     audio_prefix_codes = model.autoencoder.encode(wav_prefix.unsqueeze(0))
-    PREFIX_AUDIO_CACHE[prefix_audio_cache_key] = audio_prefix_codes
+    PREFIX_AUDIO_CACHE[prefix_audio_cache_key] = audio_prefix_codes.clone()
     # Save to disk (non-blocking)
     if enable_disk_cache:
         threading.Thread(
