@@ -4,7 +4,7 @@ torch<2.9
 torchaudio
 
 #TRITON*************************************
-#https://github.com/woct0rdho/triton-windows/releases/download/empty/triton-3.3.0-py3-none-any.whl ; sys_platform == 'win32' #egg:3.3.0
+https://github.com/woct0rdho/triton-windows/releases/download/empty/triton-3.3.0-py3-none-any.whl ; sys_platform == 'win32' #egg:3.3.0
 triton-windows; sys_platform == 'win32' # tw
 
 
