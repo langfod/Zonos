@@ -5,6 +5,31 @@ import torch
 import torchaudio
 from transformers.models.dac import DacModel
 
+_GLOBAL_DAC_AUTOENCODER = None
+
+def preload_dac_autoencoder(device: torch.device | None = None, warmup: bool = False):
+    """
+    Ensure the DAC model weights are loaded early (and optionally CUDA kernels warmed).
+    Idempotent: returns existing singleton if already created.
+    """
+    global _GLOBAL_DAC_AUTOENCODER
+    if _GLOBAL_DAC_AUTOENCODER is None:
+        _GLOBAL_DAC_AUTOENCODER = DACAutoencoder()
+        if device is not None:
+            _GLOBAL_DAC_AUTOENCODER.dac.to(device)
+        if warmup:
+            with torch.no_grad():
+                # minimal dummy codes to force first decode graph / kernel load
+                dummy = torch.zeros(
+                    1,
+                    _GLOBAL_DAC_AUTOENCODER.num_codebooks,
+                    1,
+                    dtype=torch.long,
+                    device=_GLOBAL_DAC_AUTOENCODER.dac.device,
+                )
+                _ = _GLOBAL_DAC_AUTOENCODER.decode(dummy)
+    return _GLOBAL_DAC_AUTOENCODER
+
 class DACAutoencoder:
     def __init__(self):
         super().__init__()

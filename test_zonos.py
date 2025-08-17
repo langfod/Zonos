@@ -3,33 +3,30 @@
 Zonos Text-to-Speech Application with Gradio Interface
 """
 import asyncio
-# Standard library imports
 import logging
 import math
 
 from argparse import ArgumentParser
 from os import environ as os_environ
-from sys import (stdout, platform, exit)
+from sys import (stdout, exit)
 from time import  perf_counter_ns
 
 # Third-party imports
 
-import sys
-import time
+
 import traceback
 from pathlib import Path
 from scipy.io.wavfile import write
-import numpy as np
 import torch
 from loguru import logger
-import torchaudio
+
 from utilities.cache_utils import save_torchaudio_wav
 # Local imports - utilities
 from utilities.config_utils import (update_model_paths_file, parse_model_paths_file)
 from utilities.file_utils import (lcx_checkmodels)
 from utilities.report import generate_troubleshooting_report
 from utilities.audio_utils import (process_speaker_audio, process_prefix_audio)
-from utilities.model_utils import (load_model_if_needed, get_supported_models)
+from utilities.model_utils import (load_model_if_needed)
 
 
 # Zonos-specific imports
@@ -50,12 +47,12 @@ in_dotenv_needed_models = {"Zyphra/Zonos-v0.1-hybrid", "Zyphra/Zonos-v0.1-transf
 in_dotenv_needed_paths = {"HF_HOME": "./models/hf_download"}
 in_dotenv_needed_params = {
     "DISABLE_TORCH_COMPILE_DEFAULT": de_disable_torch_compile_default,
-    "DEBUG_MODE": True
+    "DEBUG_MODE": False
 }
 in_files_to_check_in_paths = []
 
 # Application configuration
-debug_mode = True
+#debug_mode = True
 LCX_APP_NAME = "CROSSOS_FILE_CHECK"
 in_model_config_file = "configmodel.txt"
 
@@ -87,7 +84,7 @@ update_model_paths_file(in_dotenv_needed_models, in_dotenv_needed_paths, in_dote
 out_dotenv_loaded_models, out_dotenv_loaded_paths, out_dotenv_loaded_params, out_dotenv_loaded_models_values = parse_model_paths_file(
     in_model_config_file, in_dotenv_needed_models, in_dotenv_needed_paths, PREFIX_MODEL, PREFIX_PATH)
 
-if debug_mode:
+if out_dotenv_loaded_params["DEBUG_MODE"]:
     print("Loaded models:", out_dotenv_loaded_models)
     print("Loaded models values:", out_dotenv_loaded_models_values)
     print("Loaded paths:", out_dotenv_loaded_paths)
@@ -123,7 +120,7 @@ if args.sysreport:
     print(full_report)
     exit()
 
-if debug_mode:
+if out_dotenv_loaded_params["DEBUG_MODE"]:
     print("---current model paths---------")
     for id in out_dotenv_loaded_models:
         print(f"{id}: {out_dotenv_loaded_models[id]}")
@@ -231,17 +228,17 @@ async def generate_audio(model_choice, text, language, speaker_audio, prefix_aud
     """
     Generates audio based on the provided UI parameters.
     """
-    logging.info(f"Requested: \"{text}\"")
+    #logging.info(f"Requested: \"{text}\"")
     # Start timing the entire function
-    func_start_time = perf_counter_ns()
+    #func_start_time = perf_counter_ns()
 
     # Time the model loading specifically
-    load_start_time = perf_counter_ns()
+    #load_start_time = perf_counter_ns()
     selected_model = load_model_wrapper(model_choice)
-    load_end_time = perf_counter_ns()
-    load_duration_ms = (load_end_time - load_start_time) / 1000000  # Convert to milliseconds
-    if load_duration_ms > 0.005:
-        logging.info(f"Model loading took: {load_duration_ms:.4f} ms")
+    #load_end_time = perf_counter_ns()
+    #load_duration_ms = (load_end_time - load_start_time) / 1000000  # Convert to milliseconds
+    #if load_duration_ms > 0.005:
+    #    logging.info(f"Model loading took: {load_duration_ms:.4f} ms")
 
     # Convert parameters to appropriate types
     speaker_noised_bool = bool(speaker_noised)
@@ -265,39 +262,28 @@ async def generate_audio(model_choice, text, language, speaker_audio, prefix_aud
         seed = torch.randint(0, 2 ** 32 - 1, (1,)).item()
     torch.manual_seed(seed)
 
+    speaker_embedding_start_time = perf_counter_ns()
     # Process speaker audio if provided
     speaker_embedding = None
     if speaker_audio is not None and "speaker" not in unconditional_keys:
-        speaker_embedding_start_time = perf_counter_ns()
         speaker_embedding = process_speaker_audio(speaker_audio_path=speaker_audio, uuid=uuid, model=selected_model, device=DEFAULT_DEVICE,enable_disk_cache=True)
-        speaker_embedding_duration_ms = (perf_counter_ns() - speaker_embedding_start_time) / 1000000
-        logging.info(f"speaker_embedding took: {speaker_embedding_duration_ms:.4f} ms")
-
-    # Process prefix audio if provided
-    audio_prefix_codes = None
-    if prefix_audio is not None:
-        audio_prefix_start_time = perf_counter_ns()
-
-        audio_prefix_codes = process_prefix_audio(prefix_audio_path=prefix_audio, model=selected_model, device=DEFAULT_DEVICE)
-
-        process_prefix_audio_duration_ms = (perf_counter_ns() - audio_prefix_start_time) /1000000
-        logging.info(f"process_prefix_audio took: {process_prefix_audio_duration_ms:.4f} ms")
-
-    vq_val = [float(vq_single)] * 8
 
     # Create conditioning dictionary
+    vq_val = [float(vq_single)] * 8 if model_choice != "Zyphra/Zonos-v0.1-hybrid" else None
     cond_dict = make_cond_dict(
-        text=text, language=language, speaker=speaker_embedding, emotion=[e1, e2, e3, e4, e5, e6, e7, e8],
+        text=text, language=language, speaker=await speaker_embedding if speaker_embedding is not None else None, emotion=[e1, e2, e3, e4, e5, e6, e7, e8],
         vqscore_8=vq_val, fmax=fmax, pitch_std=pitch_std, speaking_rate=speaking_rate,
         dnsmos_ovrl=dnsmos_ovrl, speaker_noised=speaker_noised_bool, device=DEFAULT_DEVICE,
         unconditional_keys=unconditional_keys
     )
     conditioning = selected_model.prepare_conditioning(cond_dict)
-
-    # Progress tracking
-    estimated_generation_duration = 30 * len(text) / 400
-    estimated_total_steps = int(estimated_generation_duration * 86)
-
+    speaker_embedding_duration_ms = (perf_counter_ns() - speaker_embedding_start_time) / 1000000
+    logging.info(f"speaker_embedding took: {speaker_embedding_duration_ms:.4f} ms")
+   
+    # Process prefix audio if provided
+    audio_prefix_codes = None
+    if prefix_audio is not None:
+        audio_prefix_codes = process_prefix_audio(prefix_audio_path=prefix_audio, model=selected_model, device=DEFAULT_DEVICE)
 
     # Generate audio codes
     generate_start_time = perf_counter_ns()
@@ -339,21 +325,21 @@ async def generate_audio(model_choice, text, language, speaker_audio, prefix_aud
 
     logging.info(f"'generate' took {(end - generate_start_time) /1000000:.4f} ms")
     # Decode audio and convert to numpy
-    wav_np = selected_model.autoencoder.decode_to_int16(codes)
-    #wav_np = selected_model.autoencoder.decode(codes)
+    #wav_np = selected_model.autoencoder.decode_to_int16(codes)
+    wav_np = selected_model.autoencoder.decode(codes)
 
-    #output_wav_path = save_torchaudio_wav(wav_np.squeeze(0).cpu(), selected_model.autoencoder.sampling_rate, audio_path=speaker_audio,uuid=uuid)
+    output_wav_path = save_torchaudio_wav(wav_np.squeeze(0), selected_model.autoencoder.sampling_rate, audio_path=speaker_audio,uuid=uuid)
     # Log execution time
-    func_end_time = perf_counter_ns()
-    total_duration_s = (func_end_time - func_start_time)  / 1_000_000_000  # Convert nanoseconds to seconds
+    #func_end_time = perf_counter_ns()
+    #total_duration_s = (func_end_time - func_start_time)  / 1_000_000_000  # Convert nanoseconds to seconds
     #wav_length = wav_np.shape[-1]   / selected_model.autoencoder.sampling_rate
-    wav_length = len(wav_np) / selected_model.autoencoder.sampling_rate
-    logging.info(f"Total 'generate_audio' for {speaker_audio} execution time: {total_duration_s:.2f} seconds")
-    logging.info(f"Generated audio length: {wav_length:.2f} seconds {selected_model.autoencoder.sampling_rate}. Speed: {wav_length / total_duration_s:.2f}x")
+    #wav_length = len(wav_np) / selected_model.autoencoder.sampling_rate
+    #logging.info(f"Total 'generate_audio' for {speaker_audio} execution time: {total_duration_s:.2f} seconds")
+    #logging.info(f"Generated audio length: {wav_length:.2f} seconds {selected_model.autoencoder.sampling_rate}. Speed: {wav_length / total_duration_s:.2f}x")
     stdout.flush()
 
-    return (selected_model.autoencoder.sampling_rate, wav_np), uuid
-    #return [await output_wav_path, uuid]
+    #return (selected_model.autoencoder.sampling_rate, wav_np), uuid
+    return [await output_wav_path, uuid]
 
 def test_generate_audio(
     model_choice,  # Ignored parameter for Zonos compatibility
@@ -410,17 +396,17 @@ if __name__ == "__main__":
     test_text= "Now let's make my mum's favourite. So three mars bars into the pan. Then we add the tuna and just stir for a bit, just let the chocolate and fish infuse. A sprinkle of olive oil and some tomato ketchup. Ladle it over some fresh Khajiit meat. Now smell that. Oh boy this is going to be incredible."
     try:
         # Run twice to warm model and caches
-        [sampling_rate, wav_numpy], seed_int = test_generate_audio(model_choice=modelchoice,text=test_text,speaker_audio=test_asset,seed=42)
-        write("test_audio_output1.wav", sampling_rate, wav_numpy.cpu().numpy())
+        [output_wav_path, seed_int] = test_generate_audio(model_choice=modelchoice,text=test_text,speaker_audio=test_asset,seed=42)
 
-        [sampling_rate, wav_numpy], seed_int = test_generate_audio(model_choice=modelchoice,text=test_text,speaker_audio=test_asset,seed=42)
+        [output_wav_path, seed_int] = test_generate_audio(model_choice=modelchoice,text=test_text,speaker_audio=test_asset,seed=42)
+        [output_wav_path, seed_int] = test_generate_audio(model_choice=modelchoice,text=test_text,speaker_audio=test_asset,seed=42)
+        [output_wav_path, seed_int] = test_generate_audio(model_choice=modelchoice,text=test_text,speaker_audio=test_asset,seed=42)
+
         # Reset for next run
         #sampling_rate, wav_numpy, seed_int = None,  None , 0
         #[sampling_rate, wav_numpy], seed_int = test_generate_audio(model_choice=modelchoice,text=test_text,speaker_audio=test_asset,seed=42,profiling=True)
 
-        print(f"Generated audio with sampling rate: {sampling_rate}, seed: {seed_int}")
-        write("test_audio_output2.wav", sampling_rate, wav_numpy.cpu().numpy())
-        #np.save("test_audio_output",wav_numpy)
+
     except Exception as e:
         print(traceback.format_exc())
 

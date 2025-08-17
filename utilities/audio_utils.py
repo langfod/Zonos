@@ -15,38 +15,53 @@ PREFIX_AUDIO_CACHE: Dict[str, torch.Tensor] = {}
 SPEAKER_CACHE: Dict[str, torch.Tensor] = {}
 
 
-def process_speaker_audio(speaker_audio_path: str, uuid: int, model, device: torch.device, enable_disk_cache=True) -> torch.Tensor:
+async def process_speaker_audio(speaker_audio_path: str, uuid: int, model, device: torch.device, enable_disk_cache=True) -> torch.Tensor:
     """
     Process speaker audio and return speaker embedding.
     Uses caching to avoid recomputing embeddings for the same audio.
     """
     cache_key = get_cache_key(speaker_audio_path, uuid)
     if cache_key in SPEAKER_CACHE:
-        logging.info("Reused cached speaker embedding")
+        logging.info("Reused cached speaker embedding (memory).")
         return SPEAKER_CACHE[cache_key]
 
-    # If not cache try to load from disk
     if enable_disk_cache:
         speaker_embedding = load_from_disk(cache_key, "embeds", device=device)
         if speaker_embedding is not None:
-            logging.info(f"Loaded speaker embedding for {cache_key} from disk cache")
-            SPEAKER_CACHE[cache_key] = speaker_embedding
+            logging.info(f"Loaded speaker embedding for {cache_key} from disk cache.")
+            SPEAKER_CACHE[cache_key] = speaker_embedding.clone()
             return speaker_embedding
+
+    try:
+        wav, sr = torchaudio.load(speaker_audio_path)
+    except Exception as e:
+        logging.error(f"Failed to load speaker audio '{speaker_audio_path}': {e}")
+        raise
+
+    if wav.size(0) > 1:  # mix to mono
+        wav = wav.mean(dim=0, keepdim=True)
+
+    wav = wav.to(device, non_blocking=True)
+
+    logging.info("Computing speaker embedding.")
+    autocast_enabled = device.type == "cuda"
+    amp_dtype = torch.bfloat16 if autocast_enabled else None
+
+    with torch.no_grad():
+        if autocast_enabled:
+            with torch.autocast(device_type="cuda", dtype=amp_dtype):
+                speaker_embedding = model.make_speaker_embedding(wav, sr)
         else:
-            logging.info(f"Speaker embedding for {cache_key} not found in disk cache, computing new embedding")
-    # If not cached, compute the speaker embedding
-    logging.info("Computing speaker embedding")
-    wav, sr = torchaudio.load(speaker_audio_path)
-    wav = wav.to(device)
-    with torch.autocast("cuda", dtype=torch.bfloat16):
-        speaker_embedding = model.make_speaker_embedding(wav, sr)
+            speaker_embedding = model.make_speaker_embedding(wav, sr)
+
+    # Detach & cache
+    speaker_embedding = speaker_embedding.detach()
     SPEAKER_CACHE[cache_key] = speaker_embedding
 
-    # Save to disk (non-blocking)
     if enable_disk_cache:
         threading.Thread(
             target=save_to_disk,
-            args=(cache_key,"embeds", speaker_embedding),
+            args=(cache_key, "embeds", speaker_embedding.cpu()),
             daemon=True
         ).start()
 
@@ -67,24 +82,28 @@ async def process_prefix_audio(prefix_audio_path: str, model, device: torch.devi
         audio_prefix_codes = load_from_disk(prefix_audio_cache_key, "prefix", device=device)
         if audio_prefix_codes is not None:
             logging.info(f"Loaded prefix audio for {prefix_audio_cache_key} from disk cache")
-            PREFIX_AUDIO_CACHE[prefix_audio_cache_key] = audio_prefix_codes.clone()
+            # Keep directly (no clone) unless you plan to mutate downstream
+            PREFIX_AUDIO_CACHE[prefix_audio_cache_key] = audio_prefix_codes
             return audio_prefix_codes
         else:
             logging.info(f"Prefix embedding for {prefix_audio_cache_key} not found in disk cache, computing new embedding")
 
     logging.info("Encoding and caching new audio prefix.")
     wav_prefix, sr_prefix = torchaudio.load(prefix_audio_path)
-    wav_prefix = wav_prefix.to(device)
-    wav_prefix = wav_prefix.mean(0, keepdim=True)
-    wav_prefix = model.autoencoder.preprocess(wav_prefix, sr_prefix)
-    wav_prefix = wav_prefix.to(dtype=torch.float32)
-    audio_prefix_codes = model.autoencoder.encode(wav_prefix.unsqueeze(0))
-    PREFIX_AUDIO_CACHE[prefix_audio_cache_key] = audio_prefix_codes.clone()
-    # Save to disk (non-blocking)
+    if wav_prefix.size(0) > 1:
+        wav_prefix = wav_prefix.mean(dim=0, keepdim=True)
+    wav_prefix = model.autoencoder.preprocess(wav_prefix, sr_prefix).unsqueeze(0)
+    wav_prefix = wav_prefix.to(device, non_blocking=True)
+
+    with torch.no_grad():
+        audio_prefix_codes = model.autoencoder.encode(wav_prefix)
+
+    PREFIX_AUDIO_CACHE[prefix_audio_cache_key] = audio_prefix_codes
+
     if enable_disk_cache:
         threading.Thread(
             target=save_to_disk,
-            args=(prefix_audio_cache_key, "prefix", audio_prefix_codes),
+            args=(prefix_audio_cache_key, "prefix", audio_prefix_codes.detach().to("cpu")),
             daemon=True
         ).start()
 

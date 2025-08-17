@@ -122,5 +122,5 @@ async def save_torchaudio_wav(wav_tensor, sr, audio_path, uuid):
 
     filename = f"{formatted_now_time}_{get_cache_key(audio_path, uuid)}"
     path = get_wavout_dir().joinpath(f"{filename}.wav")
-    torchaudio.save(path, wav_tensor, sr, encoding="PCM_S", bits_per_sample=16)
+    torchaudio.save(path, wav_tensor.to("cpu"), sr, encoding="PCM_S", bits_per_sample=16)
     return str(path.resolve())

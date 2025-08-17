@@ -7,7 +7,7 @@ import torch
 import torch.nn as nn
 from huggingface_hub import hf_hub_download
 
-from zonos.autoencoder import DACAutoencoder
+from zonos.autoencoder import DACAutoencoder, preload_dac_autoencoder
 from zonos.backbone import BACKBONES
 from zonos.codebook_pattern import apply_delay_pattern, revert_delay_pattern
 from zonos.conditioning import PrefixConditioner
@@ -27,7 +27,7 @@ class Zonos(nn.Module):
         self.eos_token_id = config.eos_token_id
         self.masked_token_id = config.masked_token_id
 
-        self.autoencoder = DACAutoencoder()
+        self.autoencoder: DACAutoencoder = preload_dac_autoencoder(device=DEFAULT_DEVICE, warmup=True)
         self.backbone = backbone_cls(config.backbone)
         self.prefix_conditioner = PrefixConditioner(config.prefix_conditioner, dim)
         self.spk_clone_model = None

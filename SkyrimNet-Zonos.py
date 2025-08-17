@@ -46,12 +46,11 @@ in_dotenv_needed_models = {"Zyphra/Zonos-v0.1-hybrid", "Zyphra/Zonos-v0.1-transf
 in_dotenv_needed_paths = {"HF_HOME": "./models/hf_download"}
 in_dotenv_needed_params = {
     "DISABLE_TORCH_COMPILE_DEFAULT": de_disable_torch_compile_default,
-    "DEBUG_MODE": True
+    "DEBUG_MODE": False
 }
 in_files_to_check_in_paths = []
 
 # Application configuration
-debug_mode = True
 LCX_APP_NAME = "CROSSOS_FILE_CHECK"
 in_model_config_file = "configmodel.txt"
 
@@ -82,7 +81,7 @@ update_model_paths_file(in_dotenv_needed_models, in_dotenv_needed_paths, in_dote
 # Read back the values
 out_dotenv_loaded_models, out_dotenv_loaded_paths, out_dotenv_loaded_params, out_dotenv_loaded_models_values = parse_model_paths_file(
     in_model_config_file, in_dotenv_needed_models, in_dotenv_needed_paths, PREFIX_MODEL, PREFIX_PATH)
-
+debug_mode = out_dotenv_loaded_params["DEBUG_MODE"]
 if debug_mode:
     print("Loaded models:", out_dotenv_loaded_models)
     print("Loaded models values:", out_dotenv_loaded_models_values)
@@ -132,20 +131,6 @@ AI_MODEL_DIR_HY = out_dotenv_loaded_models["Zyphra/Zonos-v0.1-hybrid"]
 # =============================================================================
 # MAIN APPLICATION FUNCTIONS
 # =============================================================================
-def estimate_tokens(text: str) -> int:
-    """
-    Rough rule: assume ≈ 86 tokens per ~2-second *second*, rounded up.
-    We map as:
-        every 1 character  ≈ 1 token (char-count itself)
-        every paragraph ≈ 1.5
-    Then clamp to an upper bound quickly.
-    """
-    chars  = len(text)
-    wpm    = 160                                 # conservative WPM
-    secs   = max(1, chars // wpm * 60)           # seconds spoken
-    # empirical: ~86 tokens per second of compressed audio
-    tokens = int(86 * secs)
-    return min(tokens, 3000)
 
 def load_model_wrapper(model_choice: str, disable_torch_compile: bool = disable_torch_compile_default):
     return load_model_if_needed(model_choice, DEFAULT_DEVICE, in_dotenv_needed_models, disable_torch_compile)
@@ -200,59 +185,55 @@ async def generate_audio(model_choice, text, language, speaker_audio, prefix_aud
         seed = torch.randint(0, 2 ** 32 - 1, (1,)).item()
     torch.manual_seed(seed)
 
+    speaker_embedding_start_time = perf_counter_ns()
     # Process speaker audio if provided
     speaker_embedding = None
     if speaker_audio is not None and "speaker" not in unconditional_keys:
-        speaker_embedding_start_time = perf_counter_ns()
         speaker_embedding = process_speaker_audio(speaker_audio_path=speaker_audio, uuid=uuid, model=selected_model, device=DEFAULT_DEVICE,enable_disk_cache=True)
-        speaker_embedding_duration_ms = (perf_counter_ns() - speaker_embedding_start_time) / 1000000
-        logging.info(f"speaker_embedding took: {speaker_embedding_duration_ms:.4f} ms")
-
-    # Process prefix audio if provided
-    audio_prefix_codes = None
-    if prefix_audio is not None:
-        audio_prefix_start_time = perf_counter_ns()
-
-        audio_prefix_codes = process_prefix_audio(prefix_audio_path=prefix_audio, model=selected_model, device=DEFAULT_DEVICE)
-
-        process_prefix_audio_duration_ms = (perf_counter_ns() - audio_prefix_start_time) /1000000
-        logging.info(f"process_prefix_audio took: {process_prefix_audio_duration_ms:.4f} ms")
-
-    vq_val = [float(vq_single)] * 8
 
     # Create conditioning dictionary
+    vq_val = [float(vq_single)] * 8 #if model_choice != "Zyphra/Zonos-v0.1-hybrid" else None
     cond_dict = make_cond_dict(
-        text=text, language=language, speaker=speaker_embedding, emotion=[e1, e2, e3, e4, e5, e6, e7, e8],
+        text=text, language=language, speaker=await speaker_embedding if speaker_embedding is not None else None, emotion=[e1, e2, e3, e4, e5, e6, e7, e8],
         vqscore_8=vq_val, fmax=fmax, pitch_std=pitch_std, speaking_rate=speaking_rate,
         dnsmos_ovrl=dnsmos_ovrl, speaker_noised=speaker_noised_bool, device=DEFAULT_DEVICE,
         unconditional_keys=unconditional_keys
     )
     conditioning = selected_model.prepare_conditioning(cond_dict)
+    speaker_embedding_duration_ms = (perf_counter_ns() - speaker_embedding_start_time) / 1000000
+    logging.info(f"speaker_embedding took: {speaker_embedding_duration_ms:.4f} ms")
+   
+    # Process prefix audio if provided
+    audio_prefix_codes = None
+    if prefix_audio is not None:
+        audio_prefix_codes = process_prefix_audio(prefix_audio_path=prefix_audio, model=selected_model, device=DEFAULT_DEVICE)
 
     # Progress tracking
-    estimated_generation_duration = 30 * len(text) / 400
-    estimated_total_steps = int(estimated_generation_duration * 86)
+    callback = None
+    if do_progress:
+        estimated_generation_duration = 30 * len(text) / 400
+        estimated_total_steps = int(estimated_generation_duration * 86)
 
-    def update_progress(_frame: torch.Tensor, step: int, _total_steps: int) -> bool:
-        progress((step, estimated_total_steps))
-        return True
-    callback = update_progress if do_progress else None
+        def update_progress(_frame: torch.Tensor, step: int, _total_steps: int) -> bool:
+            progress((step, estimated_total_steps))
+            return True
+        callback = update_progress
+
     # Generate audio codes
     generate_start_time = perf_counter_ns()
     codes = selected_model.generate(
-        prefix_conditioning=conditioning, audio_prefix_codes=await audio_prefix_codes,
+        prefix_conditioning=conditioning, audio_prefix_codes=await audio_prefix_codes if audio_prefix_codes is not None else None,
         max_new_tokens=max_new_tokens, cfg_scale=cfg_scale, batch_size=1,
         disable_torch_compile=disable_torch_compile,
-        sampling_params=dict(top_p=top_p, top_k=top_k, min_p=min_p, linear=linear,
-                           conf=confidence, quad=quadratic),
+        sampling_params=dict(top_p=top_p, top_k=top_k, min_p=min_p, linear=linear, conf=confidence, quad=quadratic),
         callback=callback
     )
     logging.info(f"'generate' took {(perf_counter_ns() - generate_start_time) /1000000:.4f} ms")
     # Decode audio and convert to numpy
     #wav_np = selected_model.autoencoder.decode_to_int16(codes)
     wav_np = selected_model.autoencoder.decode(codes)
+    output_wav_path = save_torchaudio_wav(wav_np.squeeze(0), selected_model.autoencoder.sampling_rate, audio_path=speaker_audio,uuid=uuid)
 
-    output_wav_path = save_torchaudio_wav(wav_np.squeeze(0).cpu(), selected_model.autoencoder.sampling_rate, audio_path=speaker_audio,uuid=uuid)
     # Log execution time
     func_end_time = perf_counter_ns()
     total_duration_s = (func_end_time - func_start_time)  / 1_000_000_000  # Convert nanoseconds to seconds
