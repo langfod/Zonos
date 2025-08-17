@@ -1,2 +1,2 @@
 @echo off
-call pwsh -File 1_Install.ps1
+call powershell -ExecutionPolicy Bypass -File 1_Install.ps1

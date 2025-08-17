@@ -1,2 +1,2 @@
 @echo off
-call pwsh -File 2_Start_Zonos.ps1
+call powershell -ExecutionPolicy Bypass -File 2_Start_Zonos.ps1

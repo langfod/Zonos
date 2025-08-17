@@ -24,14 +24,12 @@ function Print-Banner {
                                         /____\___/|_| |_|\___/|___/                                         
  #########################################################################################################  
  #                                                                                                       #  
- #  Checking for eSpeak and MS Build Tools                                                               #  
+ #  Checking for Python, eSpeak, and MS Build Tools                                                               #  
  #  You may need to accept installation windows and close them when they complete.                       #  
  #                                                                                                       #  
  #########################################################################################################  
 '@
     Write-Host $banner
-    Write-Host "`nPlease have Python 3.12 installed" -ForegroundColor Yellow
-    Write-Host "https://www.python.org/ftp/python/3.12.10/python-3.12.10-amd64.exe" -ForegroundColor Blue
 }
 
 Set-StrictMode -Version Latest
@@ -56,18 +54,35 @@ function Test-WingetAvailable {
 Clear-Host
 Print-Banner
 
+$env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path","User")
+
 $wingetPresent = Test-WingetAvailable
 if (-not $wingetPresent) {
     Write-Warning "winget not found. Skipping winget-based installs. On Windows 10 you may need to install App Installer from the Microsoft Store."
 }
 
+Write-Header "Checking if Python 3.12 is installed"
+if ($wingetPresent) {
+    winget list --id Python.Python.3.12 --accept-source-agreements > $tempFile 2>&1
+    $found = Select-String -Path $tempFile -Pattern 'Python.Python.3.12' -SimpleMatch -Quiet
+    if (-not $found) {
+        Write-Host "Python.Python.3.12 is NOT installed. Installing via winget..."
+        Start-Process -FilePath winget -ArgumentList 'install','--id=Python.Python.3.12','-e','--silent','--accept-package-agreements','--accept-source-agreements' -NoNewWindow -Wait
+	    $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path","User")
+    } else {
+        Write-Host "Python.3.12 is already installed."
+    }
+    Remove-Item -Path $tempFile -ErrorAction SilentlyContinue
+}
+
 Write-Header "Checking if eSpeak-NG.eSpeak-NG is installed"
 if ($wingetPresent) {
-    winget list --id eSpeak-NG.eSpeak-NG > $tempFile 2>&1
+    winget list --id eSpeak-NG.eSpeak-NG --accept-source-agreements > $tempFile 2>&1
     $found = Select-String -Path $tempFile -Pattern 'eSpeak-NG.eSpeak-NG' -SimpleMatch -Quiet
     if (-not $found) {
         Write-Host "eSpeak-NG.eSpeak-NG is NOT installed. Installing via winget..."
         Start-Process -FilePath winget -ArgumentList 'install','--id=eSpeak-NG.eSpeak-NG','-e','--silent','--accept-package-agreements','--accept-source-agreements' -NoNewWindow -Wait
+	    $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path","User")
     } else {
         Write-Host "eSpeak-NG is already installed."
     }
@@ -76,12 +91,13 @@ if ($wingetPresent) {
 
 Write-Header "Checking for Visual Studio 2022 x64 Build Tools - this can fail silently if x32 is found"
 if ($wingetPresent) {
-    winget list --id Microsoft.VisualStudio.2022.BuildTools > $tempFile 2>&1
+    winget list --id Microsoft.VisualStudio.2022.BuildTools --accept-source-agreements > $tempFile 2>&1
     $found = Select-String -Path $tempFile -Pattern 'Microsoft.VisualStudio.2022.BuildTools' -SimpleMatch -Quiet
     if (-not $found) {
         Write-Host "Microsoft.VisualStudio.2022.BuildTools is NOT installed. Installing via winget (x64 workload VCTools)..."
         # Use override to pass installer args; on winget older versions this might not work. Use Start-Process anyway.
-        Start-Process -FilePath winget -ArgumentList 'install','--id=Microsoft.VisualStudio.2022.BuildTools','-e','--override','--passive --wait --add Microsoft.VisualStudio.Workload.VCTools;includeRecommended','--silent','--accept-package-agreements','--accept-source-agreements' -NoNewWindow -Wait
+        Start-Process -FilePath winget -ArgumentList 'install','--id=Microsoft.VisualStudio.2022.BuildTools','-e','--override','"--passive --wait --add Microsoft.VisualStudio.Workload.VCTools;includeRecommended"','--silent','--accept-package-agreements','--accept-source-agreements' -NoNewWindow -Wait
+	    $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path","User")
     } else {
         Write-Host "Visual Studio Build Tools already installed."
     }

@@ -1,6 +1,6 @@
 
 Windows setup meant for use with SkyrimNet either locally (or local secondary PC) install of Zonos 
-- should support Blackwell cards
+- should support Blackwell cards but not Ampere or below
 - cache files in `cache` folder
 - output files saved in `output_tmp` folder under process timestamp folders
 
