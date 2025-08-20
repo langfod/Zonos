@@ -48,14 +48,18 @@ class DACAutoencoder:
         return self.dac.encode(wav).audio_codes
 
     def decode(self, codes: torch.Tensor) -> torch.Tensor:
-        with torch.autocast(self.dac.device.type, torch.float16, enabled=self.dac.device.type != "cpu"):
+        # Use bfloat16 for better performance on modern GPUs
+        autocast_dtype = torch.bfloat16 if self.dac.device.type == "cuda" else torch.float16
+        with torch.autocast(self.dac.device.type, autocast_dtype, enabled=self.dac.device.type != "cpu"):
             return self.dac.decode(audio_codes=codes).audio_values.unsqueeze(1).float()
 
     def decode_to_int16(self, codes: torch.Tensor) -> np.ndarray:
         device = self.dac.device
-        codes = codes.to(device)
+        codes = codes.to(device, non_blocking=True)  # Use non_blocking transfer
 
-        with torch.autocast(self.dac.device.type, dtype=torch.float16, enabled=self.dac.device.type != "cpu"):
+        autocast_dtype = torch.bfloat16 if device.type == "cuda" else torch.float16
+        with torch.autocast(device.type, dtype=autocast_dtype, enabled=device.type != "cpu"):
             audio_values = self.dac.decode(audio_codes=codes).audio_values
-            audio_int16 = (audio_values.clamp(-1.0, 1.0) * 32767.0).to(torch.int16)
+            # More efficient clamping and conversion
+            audio_int16 = torch.clamp(audio_values * 32767.0, -32767.0, 32767.0).to(torch.int16)
             return audio_int16.squeeze(0).unsqueeze(1)

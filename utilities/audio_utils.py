@@ -29,19 +29,18 @@ async def process_speaker_audio(speaker_audio_path: str, uuid: int, model, devic
         speaker_embedding = load_from_disk(cache_key, "embeds", device=device)
         if speaker_embedding is not None:
             logging.info(f"Loaded speaker embedding for {cache_key} from disk cache.")
-            SPEAKER_CACHE[cache_key] = speaker_embedding.clone()
+            # Keep on target device to avoid unnecessary transfers
+            SPEAKER_CACHE[cache_key] = speaker_embedding
             return speaker_embedding
 
     try:
         wav, sr = torchaudio.load(speaker_audio_path)
+        if wav.size(0) > 1:  # mix to mono
+            wav = wav.mean(dim=0, keepdim=True)
+        wav = wav.to(device, non_blocking=True)  # Use non_blocking for async transfer
     except Exception as e:
         logging.error(f"Failed to load speaker audio '{speaker_audio_path}': {e}")
         raise
-
-    if wav.size(0) > 1:  # mix to mono
-        wav = wav.mean(dim=0, keepdim=True)
-
-    wav = wav.to(device, non_blocking=True)
 
     logging.info("Computing speaker embedding.")
     autocast_enabled = device.type == "cuda"

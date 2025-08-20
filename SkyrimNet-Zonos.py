@@ -131,6 +131,12 @@ AI_MODEL_DIR_HY = out_dotenv_loaded_models["Zyphra/Zonos-v0.1-hybrid"]
 # =============================================================================
 # MAIN APPLICATION FUNCTIONS
 # =============================================================================
+ALLOW_TF32 = True         # enable TF32 matmul on Ampere+ for faster GEMMs with minimal quality loss
+
+if ALLOW_TF32:
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.benchmark = True
+    torch.set_float32_matmul_precision("medium")
 
 def load_model_wrapper(model_choice: str, disable_torch_compile: bool = disable_torch_compile_default):
     return load_model_if_needed(model_choice, DEFAULT_DEVICE, in_dotenv_needed_models, disable_torch_compile)
@@ -199,7 +205,7 @@ async def generate_audio(model_choice, text, language, speaker_audio, prefix_aud
         dnsmos_ovrl=dnsmos_ovrl, speaker_noised=speaker_noised_bool, device=DEFAULT_DEVICE,
         unconditional_keys=unconditional_keys
     )
-    conditioning = selected_model.prepare_conditioning(cond_dict)
+    conditioning = selected_model.prepare_conditioning(cond_dict, cfg_scale=cfg_scale, use_cache=True)
     speaker_embedding_duration_ms = (perf_counter_ns() - speaker_embedding_start_time) / 1000000
     logging.info(f"speaker_embedding took: {speaker_embedding_duration_ms:.4f} ms")
    

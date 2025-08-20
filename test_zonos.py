@@ -30,8 +30,7 @@ from utilities.model_utils import (load_model_if_needed)
 
 
 # Zonos-specific imports
-from zonos.model import DEFAULT_BACKBONE_CLS as ZONOS_BACKBONE
-from zonos.conditioning import make_cond_dict, supported_language_codes
+from zonos.conditioning import make_cond_dict
 from zonos.utils import DEFAULT_DEVICE
 
 # =============================================================================
@@ -47,7 +46,7 @@ in_dotenv_needed_models = {"Zyphra/Zonos-v0.1-hybrid", "Zyphra/Zonos-v0.1-transf
 in_dotenv_needed_paths = {"HF_HOME": "./models/hf_download"}
 in_dotenv_needed_params = {
     "DISABLE_TORCH_COMPILE_DEFAULT": de_disable_torch_compile_default,
-    "DEBUG_MODE": False
+    "DEBUG_MODE": True
 }
 in_files_to_check_in_paths = []
 
@@ -138,6 +137,7 @@ ALLOW_TF32 = True         # enable TF32 matmul on Ampere+ for faster GEMMs with 
 
 if ALLOW_TF32:
     torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.benchmark = True  # optimize convolution algorithms
     torch.set_float32_matmul_precision("medium")  # hint for matmul precision (PyTorch 2.x)
 
 def summarize_profiler(prof: torch.profiler.profile, out_dir: str = "profile_logs", topk: int = 30):
@@ -201,21 +201,50 @@ def summarize_profiler(prof: torch.profiler.profile, out_dir: str = "profile_log
             ]
             f.write(",".join(row) + "\n")
     logger.info(f"Wrote profiler CSV: {csv_path}")
-    
-def estimate_tokens(text: str) -> int:
-    """
-    Rough rule: assume ≈ 86 tokens per ~2-second *second*, rounded up.
-    We map as:
-        every 1 character  ≈ 1 token (char-count itself)
-        every paragraph ≈ 1.5
-    Then clamp to an upper bound quickly.
-    """
-    chars  = len(text)
-    wpm    = 160                                 # conservative WPM
-    secs   = max(1, chars // wpm * 60)           # seconds spoken
-    # empirical: ~86 tokens per second of compressed audio
-    tokens = int(86 * secs)
-    return min(tokens, 3000)
+
+def compare_with_baseline(baseline_path: str, cur_codes: torch.tensor):
+    if not Path(baseline_path).exists():
+        print(f"[compare] Baseline file not found: {baseline_path}")
+        return 2
+    ref = torch.load(baseline_path, map_location="cpu")
+    ref_codes = ref["codes"]
+    ref_shape = tuple(ref["shape"])
+    cur_shape = tuple(cur_codes.shape)
+    # Shape check
+    shape_ok = (cur_shape[0] == ref_shape[0] and cur_shape[1] == ref_shape[1] and (abs(cur_shape[2] - ref_shape[2])/ ref_shape[2]) < 0.0099)
+    print(f"[compare] baseline shape: {ref_shape} Current shape: {cur_shape} diff: {abs(cur_shape[2] - ref_shape[2])/ ref_shape[2]:.4f} PASS: {shape_ok}")
+    # Hamming distance ratio
+    min_len = min(ref_codes.shape[-1], cur_codes.shape[-1])
+    ref_trim = ref_codes[..., :min_len]
+    cur_trim = cur_codes[..., :min_len]
+    diff = (ref_trim != cur_trim).sum().item()
+    total = ref_trim.numel()
+    hamming_ratio = diff / total
+    # Token overlap (unique)
+    ref_set = set(ref_trim.reshape(-1).tolist())
+    cur_set = set(cur_trim.reshape(-1).tolist())
+    jaccard = len(ref_set & cur_set) / max(1, len(ref_set | cur_set))
+    # Simple summary slice
+    #sample_slice = min(32, min_len)
+    #ref_head = ref_trim[0, 0, :sample_slice].tolist()
+    #cur_head = cur_trim[0, 0, :sample_slice].tolist()
+    print(f"[compare] Hamming ratio: {hamming_ratio:.4f} (fraction of differing positions)")
+    print(f"[compare] Jaccard token overlap: {jaccard:.4f}")
+    #print(f"[compare] First {sample_slice} tokens (codebook 0):")
+    #print(f"          baseline: {ref_head}")
+    #print(f"          current : {cur_head}")
+    # Heuristic pass criteria:
+    # 1. Shape matches
+    # 2. Hamming ratio not extreme (allow up to 0.999 since sampling may vary heavily)
+    # 3. Some minimal overlap (Jaccard > 0.05)
+    passed = shape_ok and hamming_ratio < 0.999 and jaccard > 0.05
+    if passed:
+        print("[compare][PASS] Regression check passed.")
+        return 0
+    else:
+        print("[compare][FAIL] Regression check failed.")
+        return 1
+
 
 def load_model_wrapper(model_choice: str, disable_torch_compile: bool = disable_torch_compile_default):
     return load_model_if_needed(model_choice, DEFAULT_DEVICE, in_dotenv_needed_models, disable_torch_compile)
@@ -224,23 +253,13 @@ def load_model_wrapper(model_choice: str, disable_torch_compile: bool = disable_
 async def generate_audio(model_choice, text, language, speaker_audio, prefix_audio, e1, e2, e3, e4, e5, e6, e7, e8,
                   vq_single, fmax, pitch_std, speaking_rate, dnsmos_ovrl, speaker_noised, cfg_scale, top_p,
                   top_k, min_p, linear, confidence, quadratic, seed, randomize_seed, unconditional_keys,
-                  disable_torch_compile=disable_torch_compile_default, do_progress=False, profiling=False):
+                  disable_torch_compile=disable_torch_compile_default, do_progress=False, profiling=False, baseline_save=False, baseline_compare=False):
     """
     Generates audio based on the provided UI parameters.
     """
-    #logging.info(f"Requested: \"{text}\"")
-    # Start timing the entire function
-    #func_start_time = perf_counter_ns()
 
-    # Time the model loading specifically
-    #load_start_time = perf_counter_ns()
     selected_model = load_model_wrapper(model_choice)
-    #load_end_time = perf_counter_ns()
-    #load_duration_ms = (load_end_time - load_start_time) / 1000000  # Convert to milliseconds
-    #if load_duration_ms > 0.005:
-    #    logging.info(f"Model loading took: {load_duration_ms:.4f} ms")
 
-    # Convert parameters to appropriate types
     speaker_noised_bool = bool(speaker_noised)
     fmax = float(fmax)
     pitch_std = float(pitch_std)
@@ -276,7 +295,8 @@ async def generate_audio(model_choice, text, language, speaker_audio, prefix_aud
         dnsmos_ovrl=dnsmos_ovrl, speaker_noised=speaker_noised_bool, device=DEFAULT_DEVICE,
         unconditional_keys=unconditional_keys
     )
-    conditioning = selected_model.prepare_conditioning(cond_dict)
+    conditioning = selected_model.prepare_conditioning(cond_dict, cfg_scale=cfg_scale, use_cache=True)
+
     speaker_embedding_duration_ms = (perf_counter_ns() - speaker_embedding_start_time) / 1000000
     logging.info(f"speaker_embedding took: {speaker_embedding_duration_ms:.4f} ms")
    
@@ -288,31 +308,36 @@ async def generate_audio(model_choice, text, language, speaker_audio, prefix_aud
     # Generate audio codes
     generate_start_time = perf_counter_ns()
     if profiling:
-            # Single-run profiling (Strategy A)
-            with torch.profiler.profile(
-                activities=[    
-                    torch.profiler.ProfilerActivity.CPU,
-                    torch.profiler.ProfilerActivity.CUDA,
-                ],
-                on_trace_ready=torch.profiler.tensorboard_trace_handler("./profile_logs"),
-                record_shapes=True,
-                profile_memory=True,
-                with_stack=True,
-                with_modules=True,
-            ) as prof:
-                with torch.inference_mode():
-                    torch.cuda.nvtx.range_push("infer_single")
-                    codes = selected_model.generate(
-                        prefix_conditioning=conditioning, audio_prefix_codes=await audio_prefix_codes,
-                        max_new_tokens=max_new_tokens, cfg_scale=cfg_scale, batch_size=1,
-                        disable_torch_compile=disable_torch_compile,
-                        sampling_params=dict(top_p=top_p, top_k=top_k, min_p=min_p, linear=linear,
-                           conf=confidence, quad=quadratic)
-                    )
-                    torch.cuda.nvtx.range_pop()
-            torch.cuda.synchronize()  # flush kernels before exiting profiler
-            end = perf_counter_ns()
-            summarize_profiler(prof, out_dir="profile_logs", topk=50)
+        # Single-run profiling (Strategy A)
+        with torch.profiler.profile(
+            activities=[    
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA,
+            ],
+            on_trace_ready=torch.profiler.tensorboard_trace_handler("./profile_logs"),
+            record_shapes=True,
+            profile_memory=True,
+            with_stack=True,
+            with_modules=True,
+        ) as prof:
+            def mark_step(*args) -> bool:
+                prof.step
+                return True
+            callback = mark_step
+
+            with torch.inference_mode():
+                torch.cuda.nvtx.range_push("infer_single")
+                codes = selected_model.generate(
+                    prefix_conditioning=conditioning, audio_prefix_codes=await audio_prefix_codes,
+                    max_new_tokens=max_new_tokens, cfg_scale=cfg_scale, batch_size=1,
+                    disable_torch_compile=disable_torch_compile,
+                    sampling_params=dict(top_p=top_p, top_k=top_k, min_p=min_p, linear=linear,
+                       conf=confidence, quad=quadratic), callback=callback
+                )
+                torch.cuda.nvtx.range_pop()
+        #torch.cuda.synchronize()  # flush kernels before exiting profiler
+        end = perf_counter_ns()
+        summarize_profiler(prof, out_dir="profile_logs", topk=50)
     else:
         codes = selected_model.generate(
                         prefix_conditioning=conditioning, audio_prefix_codes=await audio_prefix_codes,
@@ -324,10 +349,16 @@ async def generate_audio(model_choice, text, language, speaker_audio, prefix_aud
         end = perf_counter_ns()
 
     logging.info(f"'generate' took {(end - generate_start_time) /1000000:.4f} ms")
+
     # Decode audio and convert to numpy
     #wav_np = selected_model.autoencoder.decode_to_int16(codes)
     wav_np = selected_model.autoencoder.decode(codes)
-
+    if baseline_save and not baseline_compare:
+        torch.save({"codes": codes.cpu(), "shape": tuple(codes.shape), "seed": seed}, "baseline_codes.pt")
+        torch.save({"codes": wav_np.cpu(), "shape": tuple(wav_np.cpu().shape), "seed": seed}, "baseline_wav.pt")
+    if baseline_compare:
+        compare_with_baseline("baseline_codes.pt", codes.cpu())
+        compare_with_baseline("baseline_wav.pt", wav_np.cpu())
     output_wav_path = save_torchaudio_wav(wav_np.squeeze(0), selected_model.autoencoder.sampling_rate, audio_path=speaker_audio,uuid=uuid)
     # Log execution time
     #func_end_time = perf_counter_ns()
@@ -342,41 +373,44 @@ async def generate_audio(model_choice, text, language, speaker_audio, prefix_aud
     return [await output_wav_path, uuid]
 
 def test_generate_audio(
-    model_choice,  # Ignored parameter for Zonos compatibility
+    model_choice,
     text,  # Main text input
-    language = "en-us",  # Ignored parameter
+    language = "en-us",
     speaker_audio = None,  # Reference audio file (Gradio file object)
-    prefix_audio = "assets/silence_100ms.wav",  # Ignored parameter
-    e1 = 1,  # Ignored emotion parameter
-    e2 = .05,  # Ignored emotion parameter
-    e3 = .05,  # Ignored emotion parameter
-    e4 = .05,  # Ignored emotion parameter
-    e5 = .05,  # Ignored emotion parameter
-    e6 = .05,  # Ignored emotion parameter
-    e7 = 0.1,  # Ignored emotion parameter
-    e8  = 0.2,  # Ignored emotion parameter
-    vq_single  = 0.78,  # Ignored parameter
-    fmax  = 24000,  # Ignored parameter
-    pitch_std  = 45,  # Ignored parameter
-    speaking_rate  = 15,  # Ignored parameter
-    dnsmos_ovrl  = 4,  # Ignored parameter
-    speaker_noised  = True,  # Ignored parameter
-    cfg_scale  = 2,  # Ignored parameter
-    top_p =0,  # Can be used for generation
-    top_k = 0,  # Ignored parameter
-    min_p  = 0 ,  # Ignored parameter
-    linear  = 0.5,  # Ignored parameter
-    confidence  = 0.4,  # Ignored parameter
-    quadratic  = 0,  # Ignored parameter
-    seed = 0,  # Can be used for generation
-    randomize_seed = False,  # Ignored parameter
-    unconditional_keys = ["emotion"],  # Ignored parameter
-    profiling = False
+    prefix_audio = "assets/silence_100ms.wav",
+    e1 = 1,
+    e2 = .05, 
+    e3 = .05, 
+    e4 = .05, 
+    e5 = .05, 
+    e6 = .05, 
+    e7 = 0.1, 
+    e8  = 0.2,
+    vq_single  = 0.78,
+    fmax  = 22050,
+    pitch_std  = 60,
+    speaking_rate  = 15,
+    dnsmos_ovrl  = 4,
+    speaker_noised  = True,
+    cfg_scale  = 2,
+    top_p =0,
+    top_k = 0,
+    min_p  = 0 ,
+    linear  = 0.5,
+    confidence  = 0.3,
+    quadratic  = 0,
+    seed = 420,
+    randomize_seed = False,
+    unconditional_keys = ["emotion"],
+    profiling = False,
+    baseline_save = False,
+    baseline_compare = False
+
 ):
     return asyncio.run(generate_audio(model_choice, text, language, speaker_audio, prefix_audio, e1, e2, e3, e4, e5, e6, e7, e8,
                   vq_single, fmax, pitch_std, speaking_rate, dnsmos_ovrl, speaker_noised, cfg_scale, top_p,
                   top_k, min_p, linear, confidence, quadratic, seed, randomize_seed, unconditional_keys,
-                  disable_torch_compile=disable_torch_compile_default, profiling=profiling))
+                  disable_torch_compile=disable_torch_compile_default, profiling=profiling, baseline_save=baseline_save, baseline_compare=baseline_compare))
 
 
 
@@ -387,8 +421,8 @@ def test_generate_audio(
 
 if __name__ == "__main__":
     print("CUDA available:", torch.cuda.is_available())
-    modelchoice= "Zyphra/Zonos-v0.1-hybrid"
-    # modelchoice = "Zyphra/Zonos-v0.1-transformer"
+    #modelchoice= "Zyphra/Zonos-v0.1-hybrid"
+    modelchoice = "Zyphra/Zonos-v0.1-transformer"
     load_model_wrapper(modelchoice)
     test_asset=Path.cwd().joinpath("assets", "dlc1seranavoice.wav")
     #test_asset=Path.cwd().joinpath("assets", "fishaudio_horror.wav")
@@ -396,30 +430,15 @@ if __name__ == "__main__":
     test_text= "Now let's make my mum's favourite. So three mars bars into the pan. Then we add the tuna and just stir for a bit, just let the chocolate and fish infuse. A sprinkle of olive oil and some tomato ketchup. Ladle it over some fresh Khajiit meat. Now smell that. Oh boy this is going to be incredible."
     try:
         # Run twice to warm model and caches
-        [output_wav_path, seed_int] = test_generate_audio(model_choice=modelchoice,text=test_text,speaker_audio=test_asset,seed=42)
-
-        [output_wav_path, seed_int] = test_generate_audio(model_choice=modelchoice,text=test_text,speaker_audio=test_asset,seed=42)
-        [output_wav_path, seed_int] = test_generate_audio(model_choice=modelchoice,text=test_text,speaker_audio=test_asset,seed=42)
-        [output_wav_path, seed_int] = test_generate_audio(model_choice=modelchoice,text=test_text,speaker_audio=test_asset,seed=42)
+        [output_wav_path, seed_int] = test_generate_audio(model_choice=modelchoice,text=test_text,speaker_audio=test_asset,seed=4200,baseline_save=False)
+        [output_wav_path, seed_int] = test_generate_audio(model_choice=modelchoice,text=test_text,speaker_audio=test_asset,seed=4200,baseline_compare=True)
+        [output_wav_path, seed_int] = test_generate_audio(model_choice=modelchoice,text=test_text,speaker_audio=test_asset,seed=4200,baseline_compare=True)
 
         # Reset for next run
-        #sampling_rate, wav_numpy, seed_int = None,  None , 0
-        #[sampling_rate, wav_numpy], seed_int = test_generate_audio(model_choice=modelchoice,text=test_text,speaker_audio=test_asset,seed=42,profiling=True)
+        sampling_rate, seed_int = None, 0
+        [output_wav_path, seed_int] = test_generate_audio(model_choice=modelchoice,text=test_text,speaker_audio=test_asset,seed=4200,profiling=True)
 
 
     except Exception as e:
-        print(traceback.format_exc())
-
-    #print("Sleeping for 1 seconds to settle model warmup...")
-    #time.sleep(1)
-    ##
-    #try:
-    #    sampling_rate, wav_numpy, seed_int = None,  None , 0# Reset for next run
-    #    [sampling_rate, wav_numpy], seed_int = generate_audio(text=test_text,speaker_audio=test_asset,seed=42, profiling=True)
-    #    #np.save("test_audio_output",wav_numpy)
-    #    #write("test_audio_output.wav", sampling_rate, wav_numpy)
-    #    print(f"Generated audio with sampling rate: {sampling_rate}, seed: {seed_int}")
-    #except Exception as e:
-    #    print(traceback.format_exc())
-    exit(0)
-
+       print(traceback.format_exc())
+       logger.error(f"Error occurred: {e}")
