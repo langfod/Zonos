@@ -20,6 +20,7 @@ from scipy.io.wavfile import write
 import torch
 from loguru import logger
 
+from test_utils.audio_graph import plot_audio
 from utilities.cache_utils import save_torchaudio_wav
 # Local imports - utilities
 from utilities.config_utils import (update_model_paths_file, parse_model_paths_file)
@@ -28,11 +29,20 @@ from utilities.report import generate_troubleshooting_report
 from utilities.audio_utils import (process_speaker_audio, process_prefix_audio)
 from utilities.model_utils import (load_model_if_needed)
 
+from test_utils.model_whisper_utils import (initialize_whisper_model, transcribe_audio_with_whisper)
 
 # Zonos-specific imports
 from zonos.conditioning import make_cond_dict
 from zonos.utils import DEFAULT_DEVICE
 
+import warnings
+
+# Filter out the specific UserWarning
+warnings.filterwarnings(
+    "ignore",
+    message="In 2.9, this function's implementation will be changed to use torchaudio.save_with_torchcodec",
+    category=UserWarning
+)
 # =============================================================================
 # GLOBAL CONFIGURATION AND CONSTANTS
 # =============================================================================
@@ -167,6 +177,13 @@ def summarize_profiler(prof: torch.profiler.profile, out_dir: str = "profile_log
     try:
         mem_table = ka.table(sort_by="self_cpu_memory_usage", row_limit=topk)
         dump(mem_table, "top_cpu_mem.txt")
+        
+        # CUDA Memory table
+        try:
+            cuda_mem_table = ka.table(sort_by="self_cuda_memory_usage", row_limit=topk)
+            dump(cuda_mem_table, "top_cuda_mem.txt")
+        except Exception:
+            pass
     except Exception:
         pass
 
@@ -201,6 +218,76 @@ def summarize_profiler(prof: torch.profiler.profile, out_dir: str = "profile_log
             ]
             f.write(",".join(row) + "\n")
     logger.info(f"Wrote profiler CSV: {csv_path}")
+    
+    # 6. Memory Analysis Summary
+    print("\n=== MEMORY ANALYSIS ===")
+    
+    # Check current GPU memory state
+    if torch.cuda.is_available():
+        current_allocated = torch.cuda.memory_allocated() / (1024**2)
+        current_reserved = torch.cuda.memory_reserved() / (1024**2)
+        print(f"Current GPU memory: {current_allocated:.1f} MB allocated, {current_reserved:.1f} MB reserved")
+    
+    memory_ops = []
+    total_cuda_mem = 0
+    total_cpu_mem = 0
+    
+    for evt in ka:
+        cuda_mem = getattr(evt, "self_cuda_memory_usage", 0) or 0
+        cpu_mem = getattr(evt, "self_cpu_memory_usage", 0) or 0
+        if cuda_mem > 0 or cpu_mem > 0:
+            memory_ops.append({
+                'name': evt.key,
+                'count': evt.count,
+                'cuda_mem_bytes': cuda_mem,
+                'cpu_mem_bytes': cpu_mem,
+                'cuda_mem_mb': cuda_mem / (1024**2),
+                'cpu_mem_mb': cpu_mem / (1024**2),
+                'cuda_time_ms': (getattr(evt, "cuda_time_total", 0) or 0) / 1000.0
+            })
+            total_cuda_mem += cuda_mem
+            total_cpu_mem += cpu_mem
+    
+    print(f"Profiler captured CUDA memory: {total_cuda_mem / (1024**2):.2f} MB")
+    print(f"Profiler captured CPU memory: {total_cpu_mem / (1024**2):.2f} MB")
+    
+    if memory_ops:
+        # Sort by CUDA memory usage
+        memory_ops.sort(key=lambda x: x['cuda_mem_bytes'], reverse=True)
+        
+        print(f"\nTop {min(15, len(memory_ops))} memory-consuming operations:")
+        print("Operation | Count | CUDA MB | CPU MB | Time(ms)")
+        print("-" * 70)
+        
+        for i, op in enumerate(memory_ops[:15]):
+            name_short = op['name'][:35] + "..." if len(op['name']) > 35 else op['name']
+            print(f"{name_short:38} | {op['count']:5} | {op['cuda_mem_mb']:7.2f} | {op['cpu_mem_mb']:6.2f} | {op['cuda_time_ms']:8.2f}")
+        
+        # Look for optimization-related operations
+        opt_keywords = ['where', 'masked', 'scatter', 'workspace', 'copy', 'index', 'gather']
+        opt_ops = []
+        for op in memory_ops:
+            name_lower = op['name'].lower()
+            if any(kw in name_lower for kw in opt_keywords):
+                opt_ops.append(op)
+        
+        if opt_ops:
+            print(f"\n=== OPTIMIZATION-RELATED OPERATIONS ({len(opt_ops)} found) ===")
+            print("Operation | Count | CUDA MB | Time(ms)")
+            print("-" * 55)
+            for op in opt_ops:
+                name_short = op['name'][:40] + "..." if len(op['name']) > 40 else op['name']
+                print(f"{name_short:43} | {op['count']:5} | {op['cuda_mem_mb']:7.2f} | {op['cuda_time_ms']:8.2f}")
+        else:
+            print("\n=== No optimization-specific operations found in memory profile ===")
+    else:
+        print("No memory usage data found in profiler results")
+        
+    # Show general profiler statistics
+    print(f"\nProfiler Statistics:")
+    print(f"  Total events: {len(ka)}")
+    print(f"  Events with CUDA memory > 0: {len([op for op in memory_ops if op['cuda_mem_bytes'] > 0])}")
+    print(f"  Events with CPU memory > 0: {len([op for op in memory_ops if op['cpu_mem_bytes'] > 0])}")
 
 def compare_with_baseline(baseline_path: str, cur_codes: torch.tensor):
     if not Path(baseline_path).exists():
@@ -257,8 +344,8 @@ async def generate_audio(model_choice, text, language, speaker_audio, prefix_aud
     """
     Generates audio based on the provided UI parameters.
     """
-
-    selected_model = load_model_wrapper(model_choice)
+    func_start_time = perf_counter_ns()
+    
 
     speaker_noised_bool = bool(speaker_noised)
     fmax = float(fmax)
@@ -280,33 +367,42 @@ async def generate_audio(model_choice, text, language, speaker_audio, prefix_aud
     if randomize_seed:
         seed = torch.randint(0, 2 ** 32 - 1, (1,)).item()
     torch.manual_seed(seed)
-
-    speaker_embedding_start_time = perf_counter_ns()
-    # Process speaker audio if provided
-    speaker_embedding = None
-    if speaker_audio is not None and "speaker" not in unconditional_keys:
-        speaker_embedding = process_speaker_audio(speaker_audio_path=speaker_audio, uuid=uuid, model=selected_model, device=DEFAULT_DEVICE,enable_disk_cache=True)
-
-    # Create conditioning dictionary
     vq_val = [float(vq_single)] * 8 if model_choice != "Zyphra/Zonos-v0.1-hybrid" else None
-    cond_dict = make_cond_dict(
-        text=text, language=language, speaker=await speaker_embedding if speaker_embedding is not None else None, emotion=[e1, e2, e3, e4, e5, e6, e7, e8],
-        vqscore_8=vq_val, fmax=fmax, pitch_std=pitch_std, speaking_rate=speaking_rate,
-        dnsmos_ovrl=dnsmos_ovrl, speaker_noised=speaker_noised_bool, device=DEFAULT_DEVICE,
-        unconditional_keys=unconditional_keys
-    )
-    conditioning = selected_model.prepare_conditioning(cond_dict, cfg_scale=cfg_scale, use_cache=True)
 
-    speaker_embedding_duration_ms = (perf_counter_ns() - speaker_embedding_start_time) / 1000000
-    logging.info(f"speaker_embedding took: {speaker_embedding_duration_ms:.4f} ms")
-   
-    # Process prefix audio if provided
-    audio_prefix_codes = None
-    if prefix_audio is not None:
-        audio_prefix_codes = process_prefix_audio(prefix_audio_path=prefix_audio, model=selected_model, device=DEFAULT_DEVICE)
-
-    # Generate audio codes
-    generate_start_time = perf_counter_ns()
+    if not profiling:
+        selected_model = load_model_wrapper(model_choice)
+        speaker_embedding_start_time = perf_counter_ns()
+        # Process speaker audio if provided
+        speaker_embedding = None
+        if speaker_audio is not None and "speaker" not in unconditional_keys:
+            speaker_embedding = process_speaker_audio(speaker_audio_path=speaker_audio, uuid=uuid, model=selected_model, device=DEFAULT_DEVICE,enable_disk_cache=True)
+    
+        # Create conditioning dictionary
+        cond_dict = make_cond_dict(
+            text=text, language=language, speaker=await speaker_embedding if speaker_embedding is not None else None, emotion=[e1, e2, e3, e4, e5, e6, e7, e8],
+            vqscore_8=vq_val, fmax=fmax, pitch_std=pitch_std, speaking_rate=speaking_rate,
+            dnsmos_ovrl=dnsmos_ovrl, speaker_noised=speaker_noised_bool, device=DEFAULT_DEVICE,
+            unconditional_keys=unconditional_keys
+        )
+        conditioning = selected_model.prepare_conditioning(cond_dict, cfg_scale=cfg_scale, use_cache=True)
+    
+        speaker_embedding_duration_ms = (perf_counter_ns() - speaker_embedding_start_time) / 1000000
+        logging.info(f"speaker_embedding took: {speaker_embedding_duration_ms:.4f} ms")
+       
+        # Process prefix audio if provided
+        audio_prefix_codes = None
+        if prefix_audio is not None:
+            audio_prefix_codes = process_prefix_audio(prefix_audio_path=prefix_audio, model=selected_model, device=DEFAULT_DEVICE)
+    
+        # Generate audio codes
+        generate_start_time = perf_counter_ns()
+    
+    # Track memory before generation
+    if torch.cuda.is_available():
+        mem_before = torch.cuda.memory_allocated() / (1024**2)
+        reserved_before = torch.cuda.memory_reserved() / (1024**2)
+        torch.cuda.reset_peak_memory_stats()  # Reset peak tracking
+        
     if profiling:
         # Single-run profiling (Strategy A)
         with torch.profiler.profile(
@@ -327,32 +423,91 @@ async def generate_audio(model_choice, text, language, speaker_audio, prefix_aud
 
             with torch.inference_mode():
                 torch.cuda.nvtx.range_push("infer_single")
+
+                selected_model = load_model_wrapper(model_choice)
+                prof.step()
+
+                speaker_embedding_start_time = perf_counter_ns()
+                # Process speaker audio if provided
+                speaker_embedding = None
+                if speaker_audio is not None and "speaker" not in unconditional_keys:
+                    speaker_embedding = process_speaker_audio(speaker_audio_path=speaker_audio, uuid=uuid, model=selected_model, device=DEFAULT_DEVICE,enable_disk_cache=True)
+                    prof.step()
+                # Create conditioning dictionary
+                cond_dict = make_cond_dict(
+                    text=text, language=language, speaker=await speaker_embedding if speaker_embedding is not None else None, emotion=[e1, e2, e3, e4, e5, e6, e7, e8],
+                    vqscore_8=vq_val, fmax=fmax, pitch_std=pitch_std, speaking_rate=speaking_rate,
+                    dnsmos_ovrl=dnsmos_ovrl, speaker_noised=speaker_noised_bool, device=DEFAULT_DEVICE,
+                    unconditional_keys=unconditional_keys
+                )
+                prof.step()
+
+                conditioning = selected_model.prepare_conditioning(cond_dict, cfg_scale=cfg_scale, use_cache=True)
+                prof.step()
+
+                speaker_embedding_duration_ms = (perf_counter_ns() - speaker_embedding_start_time) / 1000000
+                #logging.info(f"speaker_embedding took: {speaker_embedding_duration_ms:.4f} ms")
+               
+                # Process prefix audio if provided
+                audio_prefix_codes = None
+                if prefix_audio is not None:
+                    audio_prefix_codes = await process_prefix_audio(prefix_audio_path=prefix_audio, model=selected_model, device=DEFAULT_DEVICE)
+                    prof.step()
+                # Generate audio codes
+                generate_start_time = perf_counter_ns()
+
                 codes = selected_model.generate(
-                    prefix_conditioning=conditioning, audio_prefix_codes=await audio_prefix_codes,
+                    prefix_conditioning=conditioning, audio_prefix_codes=audio_prefix_codes,
                     max_new_tokens=max_new_tokens, cfg_scale=cfg_scale, batch_size=1,
                     disable_torch_compile=disable_torch_compile,
                     sampling_params=dict(top_p=top_p, top_k=top_k, min_p=min_p, linear=linear,
                        conf=confidence, quad=quadratic), callback=callback
                 )
+                end1 = perf_counter_ns()
+                prof.step()
+                codes = selected_model.generate(
+                    prefix_conditioning=conditioning, audio_prefix_codes=audio_prefix_codes,
+                    max_new_tokens=max_new_tokens, cfg_scale=cfg_scale, batch_size=1,
+                    disable_torch_compile=disable_torch_compile,
+                    sampling_params=dict(top_p=top_p, top_k=top_k, min_p=min_p, linear=linear,
+                       conf=confidence, quad=quadratic), callback=callback
+                )
+                end2 = perf_counter_ns()
                 torch.cuda.nvtx.range_pop()
         #torch.cuda.synchronize()  # flush kernels before exiting profiler
-        end = perf_counter_ns()
+        logging.info(f"'generate1' took {(end1 - generate_start_time) /1000000:.4f} ms")
+        logging.info(f"'generate2' took {(end2 - end1) /1000000:.4f} ms")
         summarize_profiler(prof, out_dir="profile_logs", topk=50)
+        
+        # Track memory after generation  
+        if torch.cuda.is_available():
+            mem_after = torch.cuda.memory_allocated() / (1024**2)
+            reserved_after = torch.cuda.memory_reserved() / (1024**2)
+            peak_mem = torch.cuda.max_memory_allocated() / (1024**2)
+            
+            print(f"\n=== MEMORY TRACKING AROUND GENERATION ===")
+            print(f"Memory before: {mem_before:.1f} MB allocated, {reserved_before:.1f} MB reserved")
+            print(f"Memory after:  {mem_after:.1f} MB allocated, {reserved_after:.1f} MB reserved")
+            print(f"Peak memory:   {peak_mem:.1f} MB (max allocated during generation)")
+            print(f"Memory delta:  {mem_after - mem_before:+.1f} MB allocated, {reserved_after - reserved_before:+.1f} MB reserved")
+            if peak_mem > mem_before + 100:  # Spike of >100MB
+                print(f"⚠️  MEMORY SPIKE DETECTED: Peak was {peak_mem - mem_before:.1f} MB above starting memory")
     else:
         codes = selected_model.generate(
-                        prefix_conditioning=conditioning, audio_prefix_codes=await audio_prefix_codes,
+                        prefix_conditioning=conditioning, audio_prefix_codes=await audio_prefix_codes if audio_prefix_codes is not None else None,
                         max_new_tokens=max_new_tokens, cfg_scale=cfg_scale, batch_size=1,
                         disable_torch_compile=disable_torch_compile,
                         sampling_params=dict(top_p=top_p, top_k=top_k, min_p=min_p, linear=linear,
                            conf=confidence, quad=quadratic)
                     )
         end = perf_counter_ns()
+        logging.info(f"'generate' took {(end - generate_start_time) /1000000:.4f} ms")
 
-    logging.info(f"'generate' took {(end - generate_start_time) /1000000:.4f} ms")
 
     # Decode audio and convert to numpy
-    #wav_np = selected_model.autoencoder.decode_to_int16(codes)
+    wav_np16 = selected_model.autoencoder.decode_to_int16(codes)
     wav_np = selected_model.autoencoder.decode(codes)
+    words = transcribe_audio_with_whisper(wav_np.squeeze(0), selected_model.autoencoder.sampling_rate)
     if baseline_save and not baseline_compare:
         torch.save({"codes": codes.cpu(), "shape": tuple(codes.shape), "seed": seed}, "baseline_codes.pt")
         torch.save({"codes": wav_np.cpu(), "shape": tuple(wav_np.cpu().shape), "seed": seed}, "baseline_wav.pt")
@@ -361,13 +516,14 @@ async def generate_audio(model_choice, text, language, speaker_audio, prefix_aud
         compare_with_baseline("baseline_wav.pt", wav_np.cpu())
     output_wav_path = save_torchaudio_wav(wav_np.squeeze(0), selected_model.autoencoder.sampling_rate, audio_path=speaker_audio,uuid=uuid)
     # Log execution time
-    #func_end_time = perf_counter_ns()
-    #total_duration_s = (func_end_time - func_start_time)  / 1_000_000_000  # Convert nanoseconds to seconds
-    #wav_length = wav_np.shape[-1]   / selected_model.autoencoder.sampling_rate
+    func_end_time = perf_counter_ns()
+    total_duration_s = (func_end_time - func_start_time)  / 1_000_000_000  # Convert nanoseconds to seconds
+    wav_length = wav_np.shape[-1]   / selected_model.autoencoder.sampling_rate
     #wav_length = len(wav_np) / selected_model.autoencoder.sampling_rate
     #logging.info(f"Total 'generate_audio' for {speaker_audio} execution time: {total_duration_s:.2f} seconds")
-    #logging.info(f"Generated audio length: {wav_length:.2f} seconds {selected_model.autoencoder.sampling_rate}. Speed: {wav_length / total_duration_s:.2f}x")
+    logging.info(f"Generated audio length: {wav_length:.2f} seconds {selected_model.autoencoder.sampling_rate}. Speed: {wav_length / total_duration_s:.2f}x")
     stdout.flush()
+    plot_audio(wav_np16, selected_model.autoencoder.sampling_rate, words=words, audio_path=speaker_audio, uuid=uuid)
 
     #return (selected_model.autoencoder.sampling_rate, wav_np), uuid
     return [await output_wav_path, uuid]
@@ -397,7 +553,7 @@ def test_generate_audio(
     top_k = 0,
     min_p  = 0 ,
     linear  = 0.5,
-    confidence  = 0.3,
+    confidence  = 0.4,
     quadratic  = 0,
     seed = 420,
     randomize_seed = False,
@@ -421,22 +577,23 @@ def test_generate_audio(
 
 if __name__ == "__main__":
     print("CUDA available:", torch.cuda.is_available())
+    initialize_whisper_model()
     #modelchoice= "Zyphra/Zonos-v0.1-hybrid"
     modelchoice = "Zyphra/Zonos-v0.1-transformer"
-    load_model_wrapper(modelchoice)
+    #load_model_wrapper(modelchoice)
     test_asset=Path.cwd().joinpath("assets", "dlc1seranavoice.wav")
     #test_asset=Path.cwd().joinpath("assets", "fishaudio_horror.wav")
     #test_text="Testing Text. This is great!"
-    test_text= "Now let's make my mum's favourite. So three mars bars into the pan. Then we add the tuna and just stir for a bit, just let the chocolate and fish infuse. A sprinkle of olive oil and some tomato ketchup. Ladle it over some fresh Khajiit meat. Now smell that. Oh boy this is going to be incredible."
+    test_text= "Now let's make my mum's favourite. So three mars bars into the pan. Then we add the tuna and just stir for a bit, just let the chocolate and fish infuse. A sprinkle of olive oil and some tomato ketchup. Now smell that. Oh boy this is going to be incredible."
     try:
         # Run twice to warm model and caches
-        [output_wav_path, seed_int] = test_generate_audio(model_choice=modelchoice,text=test_text,speaker_audio=test_asset,seed=4200,baseline_save=False)
-        [output_wav_path, seed_int] = test_generate_audio(model_choice=modelchoice,text=test_text,speaker_audio=test_asset,seed=4200,baseline_compare=True)
-        [output_wav_path, seed_int] = test_generate_audio(model_choice=modelchoice,text=test_text,speaker_audio=test_asset,seed=4200,baseline_compare=True)
+        #[output_wav_path, seed_int] = test_generate_audio(model_choice=modelchoice,text=test_text,speaker_audio=test_asset,seed=4200,baseline_save=True)
+        #[output_wav_path, seed_int] = test_generate_audio(model_choice=modelchoice,text=test_text,speaker_audio=test_asset,seed=4200,baseline_compare=False)
+        #[output_wav_path, seed_int] = test_generate_audio(model_choice=modelchoice,text=test_text,speaker_audio=test_asset,seed=4200,baseline_compare=True)
 
         # Reset for next run
         sampling_rate, seed_int = None, 0
-        [output_wav_path, seed_int] = test_generate_audio(model_choice=modelchoice,text=test_text,speaker_audio=test_asset,seed=4200,profiling=True)
+        [output_wav_path, seed_int] = test_generate_audio(model_choice=modelchoice,text=test_text,speaker_audio=test_asset,seed=4200,profiling=True,baseline_compare=True)
 
 
     except Exception as e:

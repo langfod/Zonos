@@ -14,7 +14,6 @@ from zonos.codebook_pattern import apply_delay_pattern, revert_delay_pattern
 from zonos.conditioning import PrefixConditioner
 from zonos.config import InferenceParams, ZonosConfig
 from zonos.sampling import sample_from_logits
-from zonos.speaker_cloning import SpeakerEmbeddingLDA
 from zonos.utils import DEFAULT_DEVICE, find_multiple, pad_weight_
 
 DEFAULT_BACKBONE_CLS = next(iter(BACKBONES.values()))
@@ -30,18 +29,11 @@ class Zonos(nn.Module):
         self.autoencoder: DACAutoencoder = preload_dac_autoencoder(device=DEFAULT_DEVICE, warmup=True)
         self.backbone = backbone_cls(config.backbone)
         self.prefix_conditioner = PrefixConditioner(config.prefix_conditioner, dim)
-        self.spk_clone_model = None
         self._persistent_spk_model = None
-        # Pad embedding vocab size to multiple of 8 for better memory alignment
         # 1024 (DAC vocab) + 1 (EOS) + 1 (MASK) = 1026.
         vocab_size = find_multiple(1026, 8)  # 1026 -> 1032
         self.embeddings = nn.ModuleList([nn.Embedding(vocab_size, dim) for _ in range(self.autoencoder.num_codebooks)])
-
-        # Fused projection replacing per-codebook heads: a single Linear whose weight rows are the old heads concatenated.
-        # This reduces kernel launches while keeping identical math/output ordering.
         self.fused_heads = nn.Linear(dim, self.autoencoder.num_codebooks * 1025, bias=False)
-
-        # CUDA graph related state
         self._cg_graph = None
         self._cg_batch_size = None
         self._cg_input_ids = None
@@ -57,7 +49,6 @@ class Zonos(nn.Module):
         target_multiple = self.config.pad_vocab_to_multiple_of
         if not target_multiple:
             return
-        # Support legacy checkpoints that may still have self.heads
         head_modules = []
         if hasattr(self, "fused_heads"):
             head_modules.append(self.fused_heads)
@@ -65,8 +56,6 @@ class Zonos(nn.Module):
             head_modules.extend(self.heads)
         for w in self.embeddings:
             pad_weight_(w, target_multiple)
-        # Skip padding fused_heads to keep output divisible by num_codebooks*1025
-        # (legacy per-codebook heads could be padded individually without affecting divisibility)
         if hasattr(self, "heads"):
             for w in self.heads:
                 pad_weight_(w, target_multiple)
@@ -101,12 +90,10 @@ class Zonos(nn.Module):
         with safetensors.safe_open(model_path, framework="pt") as f:
             for k in f.keys():
                 tensor = f.get_tensor(k)
-                # Handle embedding size mismatch due to vocab padding
                 if k.startswith("embeddings.") and k.endswith(".weight"):
                     current_shape = sd[k].shape
                     loaded_shape = tensor.shape
                     if current_shape[0] != loaded_shape[0] and current_shape[1] == loaded_shape[1]:
-                        # Pad the embedding weight from old vocab size to new vocab size
                         padded_tensor = torch.zeros(current_shape, dtype=tensor.dtype, device=tensor.device)
                         padded_tensor[:loaded_shape[0]] = tensor
                         sd[k] = padded_tensor
@@ -135,11 +122,9 @@ class Zonos(nn.Module):
         out = out.view(B, one, num_codebooks, vocab).transpose(1, 2)  # [B, num_codebooks, 1, vocab]
         return out
 
-    # Legacy checkpoint conversion: map heads.* weights to fused_heads.weight
     def _load_from_state_dict(
         self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs
     ):
-        # Detect old per-head weights
         first_key = f"{prefix}heads.0.weight"
         if first_key in state_dict:
             weights = []
@@ -164,13 +149,6 @@ class Zonos(nn.Module):
             logits = uncond_logits + (cond_logits - uncond_logits) * cfg_scale
         logits[..., 1025:].fill_(-torch.inf)
         return logits
-
-    # ---------------------------- Speaker Embedding ----------------------------
-    def make_speaker_embedding(self, wav: torch.Tensor, sr: int) -> torch.Tensor:
-        if self.spk_clone_model is None:
-            self.spk_clone_model = SpeakerEmbeddingLDA()
-        _, spk_embedding = self.spk_clone_model(wav.to(self.spk_clone_model.device), sr)
-        return spk_embedding.unsqueeze(0).bfloat16()
 
     # ---------------------------- Conditioning (with optional cache) -----------
     def _create_conditioning_cache_key(self, cond_dict: dict, uncond_dict: dict | None) -> str:
@@ -198,7 +176,7 @@ class Zonos(nn.Module):
             return torch.cat([self.prefix_conditioner(cond_dict), self.prefix_conditioner(uncond_dict)])
         cache_key = self._create_conditioning_cache_key(cond_dict, uncond_dict)
         if hasattr(self, "_conditioning_cache") and cache_key in self._conditioning_cache:
-            return self._conditioning_cache[cache_key].clone()
+            return self._conditioning_cache[cache_key]
         if cfg_scale == 1.0:
             conditioning = self.prefix_conditioner(cond_dict)
         else:
@@ -210,7 +188,7 @@ class Zonos(nn.Module):
         if len(self._conditioning_cache) >= 32:
             oldest = next(iter(self._conditioning_cache))
             del self._conditioning_cache[oldest]
-        self._conditioning_cache[cache_key] = conditioning.clone()
+        self._conditioning_cache[cache_key] = conditioning
         return conditioning
 
     def _decode_one_token(
@@ -243,7 +221,7 @@ class Zonos(nn.Module):
                 hidden_states = hidden_states.repeat(2, 1, 1)
                 logits = self._compute_logits(hidden_states, inference_params, cfg_scale)
 
-            self._cg_input_ids = input_ids.clone()
+            self._cg_input_ids = input_ids
             self._cg_logits = torch.empty_like(logits)
 
             g = torch.cuda.CUDAGraph()
@@ -271,19 +249,74 @@ class Zonos(nn.Module):
         "Prefill" mode: we already have `prefix_hidden_states`, and we want
         to append new embeddings, then compute the logits.
         """
-        # Replicate input_ids if CFG is enabled
         if cfg_scale != 1.0:
             input_ids = input_ids.expand(prefix_hidden_states.shape[0], -1, -1)
         hidden_states = torch.cat([prefix_hidden_states, self.embed_codes(input_ids)], dim=1)
         return self._compute_logits(hidden_states, inference_params, cfg_scale)
+
+    def _fused_frame_update(
+        self,
+        delayed_codes: torch.Tensor,
+        offset: int, 
+        batch_size: int,
+        next_token: torch.Tensor,
+        unknown_token: int,
+        temp_mask_buffer: torch.Tensor = None
+    ) -> None:
+        """
+        
+        Combines frame extraction, masking, and assignment with contiguous memory operations
+        to reduce kernel launches and improve memory access patterns.
+        """
+        frame_slice = delayed_codes[..., offset: offset + 1]
+        if frame_slice.numel() > 0:
+            frame_view = frame_slice.view(batch_size, 9)
+            
+            if temp_mask_buffer is not None:
+                torch.eq(frame_view, unknown_token, out=temp_mask_buffer)
+                frame_view.copy_(torch.where(temp_mask_buffer, next_token, frame_view))
+            else:
+                unknown_mask = (frame_view == unknown_token)  # [B, 9]
+                frame_view.copy_(torch.where(unknown_mask, next_token, frame_view))
+
+    def _fused_parameter_updates(
+        self,
+        inference_params: InferenceParams,
+        remaining_steps: torch.Tensor,
+        step_idx: int,
+        cpu_step_counter: int = None
+    ) -> bool:
+        """
+        
+        Combines multiple parameter updates and early termination check
+        to reduce kernel launches and improve efficiency. Minimizes CPU-GPU 
+        synchronization by using CPU-side counters for most checks.
+        
+        Returns True if should break early, False otherwise.
+        """
+        inference_params.seqlen_offset += 1
+        inference_params.lengths_per_sample.add_(1)
+        remaining_steps.sub_(1)
+        
+        should_check_16 = (step_idx % 16 == 15)
+        should_check_8 = (step_idx % 8 == 7)
+        
+        if should_check_16:
+            if (remaining_steps <= 0).all():
+                return True
+        elif should_check_8 and cpu_step_counter is not None:
+            estimated_remaining = max(0, len(remaining_steps) * 10 - cpu_step_counter)
+            if estimated_remaining < 5:
+                if (remaining_steps <= 0).all():
+                    return True
+        
+        return False
 
     def setup_cache(self, batch_size: int, max_seqlen: int, dtype: torch.dtype = torch.bfloat16) -> InferenceParams:
         max_seqlen = find_multiple(max_seqlen, 8)
         key_value_memory_dict = self.backbone.allocate_inference_cache(batch_size, max_seqlen, dtype=dtype)
         lengths_per_sample = torch.full((batch_size,), 0, dtype=torch.int32)
         return InferenceParams(max_seqlen, batch_size, 0, 0, key_value_memory_dict, lengths_per_sample)
-
-    # (Original simple prepare_conditioning replaced by cached variant above)
 
     def can_use_cudagraphs(self) -> bool:
         # Only the mamba-ssm backbone supports CUDA Graphs at the moment
@@ -324,20 +357,22 @@ class Zonos(nn.Module):
         delayed_codes = apply_delay_pattern(codes, self.masked_token_id)
         delayed_prefix_audio_codes = delayed_codes[..., : prefix_audio_len + 1]
 
-        # Mask-based implementation (stable baseline)
         logits = self._prefill(prefix_conditioning, delayed_prefix_audio_codes, inference_params, cfg_scale)
         next_token = sample_from_logits(logits, **sampling_params).squeeze(-1)  # [B,9]
         offset = delayed_prefix_audio_codes.shape[2]
         frame = delayed_codes[..., offset: offset + 1]
-        frame.masked_scatter_(frame == unknown_token, next_token.unsqueeze(-1))
 
+        unknown_mask = (frame == unknown_token)
+        frame.copy_(torch.where(unknown_mask, next_token.unsqueeze(-1), frame))
         prefix_length = prefix_conditioning.shape[1] + prefix_audio_len + 1
         inference_params.seqlen_offset += prefix_length
         inference_params.lengths_per_sample[:] += prefix_length
 
         logit_bias = torch.zeros_like(logits)
         logit_bias[:, 1:, self.eos_token_id] = -torch.inf
-        #logit_bias[:, 0, self.eos_token_id] -= torch.log(torch.tensor(2.0, device=logits.device)) # Make EOS less likely because audio often is cut off
+        # Lower EOS bias reduces risk of abrupt cutoffs that can cause audio artifacts
+        eos_log_factor = torch.log(torch.tensor(2.0, device=logits.device))
+        logit_bias[:, 0, self.eos_token_id] -= eos_log_factor
 
         stopping = torch.zeros(batch_size, dtype=torch.bool, device=device)
         max_steps = delayed_codes.shape[2] - offset
@@ -347,53 +382,114 @@ class Zonos(nn.Module):
         step = 0
         nine_const = torch.tensor(9, device=device)
         arange_codebooks = torch.arange(9, device=device)
-        while torch.max(remaining_steps) > 0:
+        
+        cb_mask_expanded = arange_codebooks.unsqueeze(0).expand(batch_size, -1)
+        
+        boolean_workspace = torch.zeros((batch_size, 9, 3), dtype=torch.bool, device=device).contiguous()
+        
+        # Create views into the workspace for different mask types (eliminates separate allocations)
+        mask_cond_1_buffer = boolean_workspace[..., 0]    # [B, 9]
+        mask_cond_2_buffer = boolean_workspace[..., 1]    # [B, 9]
+        temp_mask_buffer = boolean_workspace[..., 2]      # [B, 9] (for intermediate operations)
+        
+        comparison_workspace = torch.zeros((3, batch_size, 9), dtype=torch.bool, device=device).contiguous()
+        
+        temp_remaining_buffer = torch.zeros(batch_size, device=device)
+        eos_idx_buffer = torch.zeros(batch_size, device=device)
+        
+        max_context_len = min(max_new_tokens, 100)
+        
+        cpu_step_counter = 0
+        
+        for step_idx in range(max_steps):
             offset += 1
+            cpu_step_counter += 1
+            
             if offset >= delayed_codes.shape[2]:
                 break
+                
             input_ids = delayed_codes[..., offset - 1: offset]
             logits = decode_one_token(input_ids, inference_params, cfg_scale_tensor, allow_cudagraphs=cg)
             logits += logit_bias
-            next_token = sample_from_logits(logits, generated_tokens=delayed_codes[..., :offset], **sampling_params).squeeze(-1)
+            
+            context_start = max(0, offset - max_context_len)
+            context_slice = delayed_codes[..., context_start:offset]
+            
+            next_token = sample_from_logits(logits, generated_tokens=context_slice, **sampling_params).squeeze(-1)
 
             eos_in_cb0 = (next_token[:, 0] == self.eos_token_id)
-            if eos_in_cb0.any():
-                remaining_steps[eos_in_cb0] = torch.minimum(remaining_steps[eos_in_cb0], nine_const)
-            stopping |= eos_in_cb0
-            eos_codebook_idx = 9 - remaining_steps
-            eos_codebook_idx.clamp_(max=8)
 
-            stop_rows = torch.nonzero(stopping, as_tuple=False).flatten()
-            if stop_rows.numel():
-                idxs = eos_codebook_idx[stop_rows]
-                cb_mask = arange_codebooks.unsqueeze(0)
-                eos_pos = (cb_mask == idxs.unsqueeze(1))
-                before_eos = (cb_mask < idxs.unsqueeze(1))
-                row_tokens = next_token[stop_rows]
-                row_tokens = torch.where(before_eos, self.masked_token_id, row_tokens)
-                row_tokens = torch.where(eos_pos, self.eos_token_id, row_tokens)
-                next_token[stop_rows] = row_tokens
+            torch.minimum(remaining_steps, nine_const, out=temp_remaining_buffer)
+            remaining_steps.copy_(torch.where(eos_in_cb0, temp_remaining_buffer, remaining_steps))
+            stopping.logical_or_(eos_in_cb0)
+            
+            torch.sub(nine_const, remaining_steps, out=eos_idx_buffer)
+            eos_idx_buffer.clamp_(max=8)
+
+            eos_expanded = eos_idx_buffer.unsqueeze(1)  # [B, 1] - using buffer instead of eos_codebook_idx
+            stopping_expanded = stopping.unsqueeze(1)     # [B, 1]
+            
+            torch.eq(cb_mask_expanded, eos_expanded, out=comparison_workspace[0])
+            torch.lt(cb_mask_expanded, eos_expanded, out=comparison_workspace[1])
+            comparison_workspace[2] = stopping_expanded.expand(-1, 9)
+            
+            eos_pos_view = comparison_workspace[0]
+            before_eos_view = comparison_workspace[1] 
+            stop_mask_view = comparison_workspace[2]
+            
+            torch.logical_and(stop_mask_view, before_eos_view, out=mask_cond_1_buffer)
+            torch.logical_and(stop_mask_view, eos_pos_view, out=mask_cond_2_buffer)
+            
+            next_token = torch.where(mask_cond_1_buffer, self.masked_token_id, 
+                        torch.where(mask_cond_2_buffer, self.eos_token_id, next_token))
 
             if offset < delayed_codes.shape[2]:
-                frame = delayed_codes[..., offset: offset + 1]
-                if frame.numel() > 0:
-                    mask = (frame == unknown_token).view(batch_size, 9)
-                    if mask.any():
-                        frame.view(batch_size, 9)[mask] = next_token[mask]
+                self._fused_frame_update(delayed_codes, offset, batch_size, next_token, unknown_token, temp_mask_buffer)
 
-            inference_params.seqlen_offset += 1
-            inference_params.lengths_per_sample.add_(1)
-            remaining_steps.sub_(1)
-            step += 1
-            if callback is not None and not callback(frame if frame.numel() > 0 else torch.empty(0), step, max_steps):
+            should_break = self._fused_parameter_updates(inference_params, remaining_steps, step_idx, cpu_step_counter)
+            if should_break:
+                break
+            
+            step = step_idx + 1
+            
+            if callback is not None and not callback(frame if 'frame' in locals() else torch.empty(0), step, max_steps):
                 break
 
         out_codes = revert_delay_pattern(delayed_codes)
-        out_codes.masked_fill_(out_codes >= 1024, 0)
-        out_codes = out_codes[..., : offset - 9]
+        
+        batch_size, num_codebooks, seq_len = out_codes.shape
+        valid_length = offset - 9
+        
+        search_window = min(50, valid_length // 4)
+        search_start = max(0, valid_length - search_window)
+        
+        if search_start < valid_length:
+            eos_boundary = None
+            for pos in range(search_start, valid_length):
+                eos_count = (out_codes[:, :, pos] == self.eos_token_id).sum().item()
+                if eos_count >= num_codebooks // 2:
+                    eos_boundary = pos
+                    break
+            
+            if eos_boundary is not None:
+                valid_length = eos_boundary
+                logging.info(f"Found EOS boundary at position {eos_boundary}, truncating sequence")
+
+        invalid_mask = out_codes > 1024
+        eos_mask = out_codes == 1024
+        
+        out_codes = torch.where(invalid_mask, 512, out_codes)
+        out_codes = torch.where(eos_mask, 0, out_codes)
+        
+        final_codes = out_codes[..., :valid_length]
+        
+        final_codes = torch.clamp(final_codes, 0, 1023)
 
         actual_new_tokens = offset - (prefix_audio_len + 1)
         logging.info(f"Max Token: {max_new_tokens}. Actual decoded tokens (excluding prompt): {actual_new_tokens}")
+        logging.info(f"Final offset: {offset}, prefix_audio_len: {prefix_audio_len}")
+        logging.info(f"out_codes shape before slicing: {out_codes.shape}")
+        logging.info(f"final_codes shape: {final_codes.shape}")
 
-        self._cg_graph = None  # reset cuda graph to avoid cache changes
-        return out_codes
+        self._cg_graph = None
+        return final_codes

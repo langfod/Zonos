@@ -7,6 +7,7 @@ import logging
 from typing import Optional
 from zonos.model import Zonos
 from utilities.config_utils import is_online_model
+from zonos.speaker_cloning import SpeakerEmbeddingLDA
 
 CURRENT_MODEL_TYPE: Optional[str] = None
 CURRENT_MODEL: Optional[Zonos] = None
