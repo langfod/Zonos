@@ -20,6 +20,30 @@ DEFAULT_BACKBONE_CLS = next(iter(BACKBONES.values()))
 
 
 class Zonos(nn.Module):
+    """
+    The main Zonos text-to-speech model.
+    
+    Zonos combines a neural audio codec (DAC) with a powerful language model backbone
+    to generate high-quality speech from text and conditioning inputs. It supports both
+    transformer and hybrid transformer-mamba architectures with advanced optimization
+    techniques like CUDA graphs and torch.compile.
+    
+    The model uses a prefix conditioning approach where various inputs (text, speaker,
+    acoustic parameters) are processed into conditioning embeddings that guide the
+    autoregressive generation of audio codebook tokens.
+    
+    Args:
+        config (ZonosConfig): Model configuration containing backbone and conditioning parameters
+        backbone_cls: Backbone architecture class (defaults to available implementation)
+        
+    Attributes:
+        config (ZonosConfig): Model configuration  
+        autoencoder (DACAutoencoder): Audio codec for encoding/decoding
+        backbone: Neural network backbone (transformer or mamba)
+        prefix_conditioner (PrefixConditioner): Conditioning input processor
+        embeddings (nn.ModuleList): Embedding layers for each codebook
+        fused_heads (nn.Linear): Output projection layer for all codebooks
+    """
     def __init__(self, config: ZonosConfig, backbone_cls=DEFAULT_BACKBONE_CLS):
         super().__init__()
         self.config = config
@@ -62,12 +86,30 @@ class Zonos(nn.Module):
 
     @property
     def device(self) -> torch.device:
+        """Get the device of the model parameters."""
         return next(self.parameters()).device
 
     @classmethod
     def from_pretrained(
         cls, repo_id: str, revision: str | None = None, device: str = DEFAULT_DEVICE, **kwargs
     ) -> "Zonos":
+        """
+        Load a pretrained Zonos model from Hugging Face Hub.
+        
+        Args:
+            repo_id (str): Hugging Face repository ID (e.g., 'username/model-name')
+            revision (str, optional): Git revision (branch, tag, or commit hash)
+            device (str): Target device for model placement
+            **kwargs: Additional arguments passed to from_local
+            
+        Returns:
+            Zonos: Loaded and initialized model instance
+            
+        Notes:
+            - Downloads config.json and model.safetensors from the repository
+            - Automatically selects appropriate backbone architecture
+            - Model is placed on the specified device with appropriate dtype
+        """
         config_path = hf_hub_download(repo_id=repo_id, filename="config.json", revision=revision, local_dir_use_symlinks=False)
         model_path = hf_hub_download(repo_id=repo_id, filename="model.safetensors", revision=revision, local_dir_use_symlinks=False)
         return cls.from_local(config_path, model_path, device, **kwargs)
@@ -76,6 +118,24 @@ class Zonos(nn.Module):
     def from_local(
         cls, config_path: str, model_path: str, device: str = DEFAULT_DEVICE, backbone: str | None = None
     ) -> "Zonos":
+        """
+        Load a Zonos model from local configuration and weight files.
+        
+        Args:
+            config_path (str): Path to config.json file
+            model_path (str): Path to model.safetensors file  
+            device (str): Target device for model placement
+            backbone (str, optional): Force specific backbone type ('torch', 'mamba_ssm')
+            
+        Returns:
+            Zonos: Loaded and initialized model instance
+            
+        Notes:
+            - Automatically detects transformer vs hybrid architecture from config
+            - Handles embedding weight padding for vocabulary alignment
+            - Loads model in bfloat16 precision for efficiency
+            - Ensures DAC autoencoder is placed on the same device
+        """
         config = ZonosConfig.from_dict(json.load(open(config_path)))
         if backbone:
             backbone_cls = BACKBONES[backbone]
@@ -106,6 +166,18 @@ class Zonos(nn.Module):
 
     # ---------------------------- Embedding / Heads ----------------------------
     def embed_codes(self, codes: torch.Tensor) -> torch.Tensor:
+        """
+        Convert discrete codes to embeddings.
+        
+        Sums embeddings from all codebooks to create a unified representation
+        suitable for processing by the backbone model.
+        
+        Args:
+            codes (torch.Tensor): Discrete codes of shape [batch, num_codebooks, seq_len]
+            
+        Returns:
+            torch.Tensor: Embedded codes of shape [batch, seq_len, d_model]
+        """
         return sum(emb(codes[:, i]) for i, emb in enumerate(self.embeddings))
 
     def apply_heads(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -313,12 +385,42 @@ class Zonos(nn.Module):
         return False
 
     def setup_cache(self, batch_size: int, max_seqlen: int, dtype: torch.dtype = torch.bfloat16) -> InferenceParams:
+        """
+        Set up inference cache for efficient generation.
+        
+        Creates key-value caches and other state needed for efficient autoregressive
+        generation without recomputing past states.
+        
+        Args:
+            batch_size (int): Batch size for generation
+            max_seqlen (int): Maximum sequence length to allocate for
+            dtype (torch.dtype): Data type for cache tensors
+            
+        Returns:
+            InferenceParams: Configured inference parameters with allocated caches
+            
+        Notes:
+            - Sequence length is automatically padded to multiple of 8
+            - Cache allocation is backend-specific (attention vs mamba)
+            - Length tracking is initialized to zero for all samples
+        """
         max_seqlen = find_multiple(max_seqlen, 8)
         key_value_memory_dict = self.backbone.allocate_inference_cache(batch_size, max_seqlen, dtype=dtype)
         lengths_per_sample = torch.full((batch_size,), 0, dtype=torch.int32)
         return InferenceParams(max_seqlen, batch_size, 0, 0, key_value_memory_dict, lengths_per_sample)
 
     def can_use_cudagraphs(self) -> bool:
+        """
+        Check if CUDA graphs can be used for optimization.
+        
+        Returns:
+            bool: True if CUDA graphs are supported and recommended
+            
+        Notes:
+            - Currently only mamba-ssm backbone supports CUDA graphs
+            - Requires CUDA device 
+            - CUDA graphs provide significant speedup for inference
+        """
         # Only the mamba-ssm backbone supports CUDA Graphs at the moment
         return self.device.type == "cuda" and "_mamba_ssm" in str(self.backbone.__class__)
 
@@ -334,6 +436,39 @@ class Zonos(nn.Module):
         disable_torch_compile: bool = False,
         callback: Callable[[torch.Tensor, int, int], bool] | None = None,
     ):
+        """
+        Generate audio codes autoregressively from conditioning inputs.
+        
+        This is the main generation method that produces discrete audio codes which can
+        be decoded to audio using the DAC autoencoder. It supports advanced optimizations
+        like CUDA graphs, classifier-free guidance, and efficient delay pattern handling.
+        
+        Args:
+            prefix_conditioning (torch.Tensor): Conditioning embeddings of shape 
+                [batch_size, cond_seq_len, d_model] containing text, speaker, and 
+                acoustic parameter representations
+            audio_prefix_codes (torch.Tensor, optional): Pre-existing audio codes to 
+                continue from, shape [batch_size, 9, prefix_audio_seq_len]  
+            max_new_tokens (int): Maximum number of new tokens to generate. 
+                Default 86*30 ≈ 30 seconds at 44.1kHz
+            cfg_scale (float): Classifier-free guidance scale. Higher values follow 
+                conditioning more closely. Must be > 1.0
+            batch_size (int): Batch size for generation
+            sampling_params (dict): Sampling configuration (temperature, top_p, min_p, etc.)
+            disable_torch_compile (bool): Whether to disable torch.compile optimizations
+            callback (Callable, optional): Progress callback function that receives 
+                (frame, step, max_steps) and returns bool to continue
+                
+        Returns:
+            torch.Tensor: Generated audio codes of shape [batch_size, 9, generated_length]
+            
+        Notes:
+            - Uses delay pattern for parallel codebook generation
+            - Supports CUDA graphs on compatible hardware for maximum speed
+            - Automatically handles EOS detection and sequence truncation
+            - Applies various optimizations like fused operations and memory reuse
+            - Generated codes are clamped to valid range [0, 1023]
+        """
         assert cfg_scale != 1, "TODO: add support for cfg_scale=1"
         prefix_audio_len = 0 if audio_prefix_codes is None else audio_prefix_codes.shape[2]
         device = self.device

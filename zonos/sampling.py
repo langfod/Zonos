@@ -2,18 +2,27 @@ import torch
 
 
 def multinomial(input: torch.Tensor, num_samples: int, replacement=False, *, generator=None):
-    """torch.multinomial with arbitrary number of dimensions, and number of candidates on the last dimension.
-
+    """
+    Multi-dimensional multinomial sampling with optimized single-sample case.
+    
+    Extends PyTorch's multinomial to work with arbitrary tensor dimensions,
+    with the multinomial distribution on the last dimension. For single samples,
+    uses the Gumbel-max trick for better performance.
+    
     Args:
-        input (torch.Tensor): The input tensor containing probabilities.
-        num_samples (int): Number of samples to draw.
-        replacement (bool): Whether to draw with replacement or not.
-    Keywords args:
-        generator (torch.Generator): A pseudorandom number generator for sampling.
+        input (torch.Tensor): Probability tensor with candidates on the last dimension
+        num_samples (int): Number of samples to draw from the distribution
+        replacement (bool, optional): Whether to sample with replacement. Defaults to False.
+        generator (torch.Generator, optional): Random number generator for reproducible sampling
+    
     Returns:
-        torch.Tensor: Last dimension contains num_samples indices
-            sampled from the multinomial probability distribution
-            located in the last dimension of tensor input.
+        torch.Tensor: Sampled indices with shape [..., num_samples] where the last 
+            dimension contains the sampled indices
+            
+    Notes:
+        - For single samples (num_samples=1), uses Gumbel-max trick: argmax(log(p) + gumbel_noise)
+        - For multiple samples, falls back to standard multinomial sampling
+        - Preserves all input dimensions except the last (candidate) dimension
     """
 
     if num_samples == 1:
@@ -27,15 +36,26 @@ def multinomial(input: torch.Tensor, num_samples: int, replacement=False, *, gen
 
 
 def apply_unified(probs: torch.Tensor, linear: float, conf: float, quad: float) -> torch.Tensor:
-    """Sample next token using unified sampling approach that combines linear scaling, confidence, and quadratic terms.
+    """
+    Apply NovelAI's unified sampling approach for advanced token selection.
+    
+    Combines linear scaling, entropy-based confidence adjustment, and quadratic
+    penalties to create more nuanced sampling behavior than traditional methods.
     
     Args:
-        probs (torch.Tensor): Input probabilities with token candidates on the last dimension.
-        linear (float): Linear scaling factor applied to log probabilities.
-        conf (float): Confidence factor that scales the entropy term.
-        quad (float): Quadratic penalty factor applied to squared log probabilities.
+        probs (torch.Tensor): Input probabilities with token candidates on the last dimension
+        linear (float): Linear scaling factor applied to log probabilities (0-1)
+        conf (float): Confidence factor that scales the entropy term (-2 to 2)
+        quad (float): Quadratic penalty factor applied to squared log probabilities (-2 to 2)
+        
     Returns:
-        torch.Tensor: Modified probability distribution after applying unified sampling.
+        torch.Tensor: Modified probability distribution after applying unified sampling
+        
+    Notes:
+        - Based on NovelAI's research for more controllable text generation
+        - Lower linear values produce more unusual/creative outputs
+        - Conf and quad interact with entropy to fine-tune randomness
+        - Recommended starting point: quad = 1/3 - linear*4/15, conf = -quad/2
     """
     logprobs = torch.log(probs.clamp_min(1e-20))
     entropy = -torch.sum(probs * logprobs, dim=-1, keepdim=True)
@@ -80,14 +100,25 @@ def apply_top_p(probs: torch.Tensor, p: float) -> torch.Tensor:
 
 
 def apply_min_p(probs: torch.Tensor, min_p: float) -> torch.Tensor:
-    """Sample next token using min-p sampling.
+    """
+    Apply min-p sampling by filtering tokens below a dynamic threshold.
+
+    Min-p sampling removes tokens with probability less than min_p * max_probability,
+    creating an adaptive threshold that scales with the confidence of the most likely token.
 
     Args:
-        scores (torch.FloatTensor): Input logits with token candidates on the last dimension.
-        min_p (float): Minimum token probability, scaled by the probability of the most likely token.
-                       Must be between 0 and 1. Typical values are in the 0.01-0.2 range.
+        probs (torch.Tensor): Input probabilities with token candidates on the last dimension
+        min_p (float): Minimum token probability threshold, scaled by the most likely token.
+            Must be between 0 and 1. Typical values are 0.01-0.2.
+
     Returns:
-        torch.Tensor: Sampled tokens.
+        torch.Tensor: Filtered and renormalized probability distribution
+        
+    Notes:
+        - More adaptive than fixed probability thresholds
+        - Threshold scales with the model's confidence (higher max_prob = higher threshold)
+        - If threshold is too high, no tokens may remain (leading to potential silence)
+        - Often preferred over top-p for more consistent quality
     """
     top_probs, _ = probs.max(dim=-1, keepdim=True)
     tokens_to_remove = probs < (min_p * top_probs)
@@ -102,10 +133,28 @@ def modify_logit_for_repetition_penalty(
     repetition_penalty: float,
     repetition_penalty_window: int,
 ):
-    """See https://arxiv.org/abs/1909.05858
-    Apply repetition penalty over a sliding window of the last `repetition_penalty_window` tokens.
-    logits: (batch_size, n_codebooks, vocab_size)
-    generated_tokens: (batch_size, n_codebooks, seq_len)
+    """
+    Apply repetition penalty to reduce repeated token generation.
+    
+    Implements the repetition penalty from "CTRL: A Conditional Transformer Language Model
+    for Controllable Generation" (https://arxiv.org/abs/1909.05858). Tokens that appear
+    in the recent history have their logits modified to discourage repetition.
+    
+    Args:
+        logits (torch.Tensor): Current logits of shape [batch_size, n_codebooks, vocab_size]
+        generated_tokens (torch.Tensor): Recently generated tokens of shape 
+            [batch_size, n_codebooks, seq_len]
+        repetition_penalty (float): Penalty strength. >1.0 discourages repetition, 
+            <1.0 encourages it
+        repetition_penalty_window (int): Number of recent tokens to consider for penalty
+        
+    Returns:
+        torch.Tensor: Modified logits with repetition penalty applied
+        
+    Notes:
+        - Only considers the most recent repetition_penalty_window tokens
+        - Penalty is applied multiplicatively: logits *= penalty if logits > 0, else /= penalty
+        - Uses scatter_reduce for efficient batched operation across codebooks
     """
     generated_tokens = generated_tokens[..., -repetition_penalty_window:]
     generated_tokens = generated_tokens.clamp_max(logits.shape[-1] - 1).to(torch.int64)

@@ -10,6 +10,30 @@ from zonos.utils import DEFAULT_DEVICE
 
 
 class Conditioner(nn.Module):
+    """
+    Base class for all conditioning modules in the Zonos system.
+    
+    This abstract class defines the interface for conditioning inputs that guide
+    the audio generation process. Conditioners transform various input modalities
+    (text, speaker embeddings, acoustic parameters) into a common embedding space.
+    
+    Args:
+        output_dim (int): Dimensionality of the output conditioning embeddings
+        name (str): Unique identifier for this conditioner  
+        cond_dim (int, optional): Input conditioning dimension. Defaults to output_dim.
+        projection (str, optional): Type of projection to apply ('none', 'linear', 'mlp'). 
+            Defaults to 'none'.
+        uncond_type (str, optional): Type of unconditional embedding ('learned', 'none').
+            Defaults to 'none'.
+        **kwargs: Additional arguments passed to specific conditioner implementations.
+    
+    Attributes:
+        name (str): The conditioner's identifier
+        output_dim (int): Output embedding dimension
+        cond_dim (int): Input conditioning dimension  
+        project (nn.Module): Projection layer (Identity, Linear, or MLP)
+        uncond_vector (nn.Parameter, optional): Learned unconditional embedding vector
+    """
     def __init__(
         self,
         output_dim: int,
@@ -40,9 +64,40 @@ class Conditioner(nn.Module):
             self.uncond_vector = nn.Parameter(torch.zeros(output_dim))
 
     def apply_cond(self, *inputs: Any) -> torch.Tensor:
+        """
+        Apply conditioning logic specific to each conditioner type.
+        
+        This abstract method must be implemented by subclasses to define how
+        the specific input modality should be processed into conditioning embeddings.
+        
+        Args:
+            *inputs: Variable arguments depending on the conditioner type
+            
+        Returns:
+            torch.Tensor: Processed conditioning embeddings
+            
+        Raises:
+            NotImplementedError: This method must be implemented by subclasses
+        """
         raise NotImplementedError()
 
     def forward(self, inputs: tuple[Any, ...] | None) -> torch.Tensor:
+        """
+        Forward pass through the conditioner.
+        
+        Processes inputs through the conditioner pipeline: apply_cond -> project -> output.
+        Handles both conditional inputs and unconditional generation.
+        
+        Args:
+            inputs (tuple or None): Input arguments for conditioning. If None,
+                returns the learned unconditional vector if available.
+                
+        Returns:
+            torch.Tensor: Conditioning embeddings of shape [batch, seq_len, output_dim]
+            
+        Raises:
+            AssertionError: If inputs is None but no unconditional vector is learned
+        """
         if inputs is None:
             assert self.uncond_vector is not None
             return self.uncond_vector.data.view(1, 1, -1)
@@ -91,6 +146,7 @@ _number_re = re.compile(r"[0-9]+")
 
 
 def _remove_commas(m: re.Match) -> str:
+    """Remove commas from number matches for text normalization."""
     return m.group(1).replace(",", "")
 
 
@@ -139,6 +195,21 @@ def _expand_number(m: re.Match) -> str:
 
 
 def normalize_numbers(text: str) -> str:
+    """
+    Normalize numbers in text to their written form.
+    
+    Converts various numeric formats (decimals, currency, ordinals, etc.) to their
+    spelled-out equivalents for better phoneme generation and speech synthesis.
+    
+    Args:
+        text (str): Input text potentially containing numeric expressions
+        
+    Returns:
+        str: Text with numbers converted to written form
+        
+    Example:
+        "I have $5.50 and it's 3rd place" -> "I have five dollars, fifty cents and it's third place"
+    """
     text = re.sub(_comma_number_re, _remove_commas, text)
     text = re.sub(_pounds_re, r"\1 pounds", text)
     text = re.sub(_dollars_re, _expand_dollars, text)
@@ -188,6 +259,23 @@ def normalize_jp_text(text: str, tokenizer=Dictionary(dict="full").create()) -> 
 
 
 def clean(texts: list[str], languages: list[str]) -> list[str]:
+    """
+    Clean and normalize text for phonemization.
+    
+    Applies language-specific text cleaning including Japanese text normalization
+    and number expansion for better phoneme generation.
+    
+    Args:
+        texts (list[str]): List of input texts to clean
+        languages (list[str]): Corresponding language codes for each text
+        
+    Returns:
+        list[str]: Cleaned texts ready for phonemization
+        
+    Notes:
+        - Japanese text undergoes special kanji number conversion and tokenization
+        - Other languages get standard number normalization
+    """
     texts_out = []
     for text, language in zip(texts, languages):
         if "ja" in language:
@@ -217,6 +305,25 @@ def get_backend(language: str) -> "EspeakBackend":
 
 
 def phonemize(texts: list[str], languages: list[str]) -> list[str]:
+    """
+    Convert text to phonemes using eSpeak backend.
+    
+    Transforms cleaned text into phonetic representations using the eSpeak
+    text-to-speech system, which provides high-quality phonemization for
+    many languages.
+    
+    Args:
+        texts (list[str]): List of cleaned texts to phonemize
+        languages (list[str]): Corresponding language codes (ISO 639-1 or eSpeak compatible)
+        
+    Returns:
+        list[str]: Phonemic representations of the input texts
+        
+    Notes:
+        - Text is automatically cleaned before phonemization
+        - Uses cached eSpeak backends for efficiency
+        - Preserves punctuation and stress marks for better prosody
+    """
     texts = clean(texts, languages)
 
     batch_phonemes = []
@@ -229,15 +336,42 @@ def phonemize(texts: list[str], languages: list[str]) -> list[str]:
 
 
 class EspeakPhonemeConditioner(Conditioner):
+    """
+    Conditioner that converts text to phoneme embeddings using eSpeak.
+    
+    This conditioner takes text input and language codes, converts them to phonemic
+    representations using eSpeak, and then embeds the phonemes into a dense vector space
+    suitable for conditioning audio generation.
+    
+    Args:
+        output_dim (int): Dimension of output embeddings
+        **kwargs: Additional arguments passed to parent Conditioner
+        
+    Attributes:
+        phoneme_embedder (nn.Embedding): Embedding layer for phoneme tokens
+    """
     def __init__(self, output_dim: int, **kwargs):
         super().__init__(output_dim, **kwargs)
         self.phoneme_embedder = nn.Embedding(len(SPECIAL_TOKEN_IDS) + len(symbols), output_dim)
 
     def apply_cond(self, texts: list[str], languages: list[str]) -> torch.Tensor:
         """
+        Convert texts to phoneme embeddings.
+        
+        Transforms input texts into phonemic representations using eSpeak, tokenizes
+        the phonemes, and embeds them into dense vectors for conditioning.
+        
         Args:
-            texts: list of texts to convert to phonemes
-            languages: ISO 639-1 -or otherwise eSpeak compatible- language code
+            texts (list[str]): List of texts to convert to phonemes
+            languages (list[str]): ISO 639-1 or eSpeak-compatible language codes
+            
+        Returns:
+            torch.Tensor: Phoneme embeddings of shape [batch, max_phoneme_length, output_dim]
+            
+        Notes:
+            - Automatically handles tokenization including BOS/EOS tokens
+            - Sequences are padded to the same length within the batch
+            - Device placement is handled automatically
         """
         device = self.phoneme_embedder.weight.device
 
@@ -252,6 +386,26 @@ class EspeakPhonemeConditioner(Conditioner):
 
 
 class FourierConditioner(Conditioner):
+    """
+    Fourier feature conditioner for continuous scalar inputs.
+    
+    Applies random Fourier features to continuous inputs to create rich positional
+    encodings. This is particularly useful for conditioning on continuous parameters
+    like pitch, duration, or other acoustic features.
+    
+    Args:
+        output_dim (int): Output embedding dimension (must be even)
+        input_dim (int, optional): Input feature dimension. Defaults to 1.
+        std (float, optional): Standard deviation for random frequency weights. Defaults to 1.0.
+        min_val (float, optional): Minimum expected input value for normalization. Defaults to 0.0.
+        max_val (float, optional): Maximum expected input value for normalization. Defaults to 1.0.
+        **kwargs: Additional arguments passed to parent Conditioner
+        
+    Notes:
+        - Output dimension must be even to accommodate sin/cos pairs
+        - Random frequencies are sampled once and frozen during training
+        - Input values are normalized to [0,1] range before Fourier transform
+    """
     def __init__(
         self,
         output_dim: int,
@@ -267,6 +421,20 @@ class FourierConditioner(Conditioner):
         self.input_dim, self.min_val, self.max_val = input_dim, min_val, max_val
 
     def apply_cond(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Apply random Fourier features to input tensor.
+        
+        Args:
+            x (torch.Tensor): Input tensor of shape [batch, seq_len, input_dim]
+            
+        Returns:
+            torch.Tensor: Fourier features of shape [batch, seq_len, output_dim]
+            
+        Notes:
+            - Input is normalized to [0,1] range using min_val/max_val
+            - Applies random Fourier transformation: cat([cos(2πxW), sin(2πxW)])
+            - Output contains both cosine and sine components for rich representations
+        """
         assert x.shape[-1] == self.input_dim
         x = (x - self.min_val) / (self.max_val - self.min_val)  # [batch_size, seq_len, input_dim]
         f = 2 * torch.pi * x.to(self.weight.dtype) @ self.weight.T  # [batch_size, seq_len, output_dim // 2]
@@ -274,6 +442,21 @@ class FourierConditioner(Conditioner):
 
 
 class IntegerConditioner(Conditioner):
+    """
+    Conditioner for discrete integer inputs using learnable embeddings.
+    
+    Maps integer values to dense embeddings, similar to standard embedding layers
+    but integrated into the conditioning framework.
+    
+    Args:
+        output_dim (int): Output embedding dimension
+        min_val (int, optional): Minimum integer value. Defaults to 0.
+        max_val (int, optional): Maximum integer value. Defaults to 512.
+        **kwargs: Additional arguments passed to parent Conditioner
+        
+    Attributes:
+        int_embedder (nn.Embedding): Embedding layer for integer tokens
+    """
     def __init__(self, output_dim: int, min_val: int = 0, max_val: int = 512, **kwargs):
         super().__init__(output_dim, **kwargs)
         self.min_val = min_val
@@ -303,6 +486,20 @@ _cond_cls_map = {
 
 
 def build_conditioners(conditioners: list[dict], output_dim: int) -> list[Conditioner]:
+    """
+    Build a list of conditioner instances from configuration dictionaries.
+    
+    Args:
+        conditioners (list[dict]): List of conditioner configurations, each containing
+            a 'type' key and additional parameters
+        output_dim (int): Output dimension for all conditioners
+        
+    Returns:
+        list[Conditioner]: Instantiated conditioner objects
+        
+    Raises:
+        KeyError: If an unknown conditioner type is specified
+    """
     return [_cond_cls_map[config["type"]](output_dim, **config) for config in conditioners]
 
 
@@ -387,8 +584,36 @@ def make_cond_dict(
     device: torch.device | str = DEFAULT_DEVICE,
 ) -> dict:
     """
-    A helper to build the 'cond_dict' that the model expects.
-    By default, it will generate a random speaker embedding
+    Build a conditioning dictionary for Zonos audio generation.
+    
+    This helper function creates a properly formatted conditioning dictionary containing
+    all the parameters needed to guide audio generation. It handles tensor conversion,
+    device placement, and normalization automatically.
+    
+    Args:
+        text (str): Text to be synthesized
+        language (str): Language code (eSpeak compatible, e.g., 'en-us', 'fr-fr')
+        speaker (torch.Tensor, optional): Speaker embedding tensor. If None, random embedding used.
+        emotion (list[float]): 8-element emotion vector [Happiness, Sadness, Disgust, Fear, 
+            Surprise, Anger, Other, Neutral]. Values should sum to 1.0.
+        fmax (float): Maximum frequency in Hz (0-24000). Use 22050 for voice cloning.
+        pitch_std (float): Pitch variation (0-400). 20-45 for normal, 60-150 for expressive speech.
+        speaking_rate (float): Phonemes per minute (0-40). 10 is slow, 30 is very fast.
+        vqscore_8 (list[float]): Voice quality scores for 8 segments. Only used with hybrid model.
+        ctc_loss (float): CTC target loss. Only used with hybrid model.
+        dnsmos_ovrl (float): DNS-MOS overall score. Only used with hybrid model.
+        speaker_noised (bool): Whether to add noise to speaker embedding. Hybrid model only.
+        unconditional_keys (Iterable[str]): Keys to remove for unconditional generation.
+        device (torch.device | str): Target device for tensors.
+        
+    Returns:
+        dict: Formatted conditioning dictionary with properly shaped and normalized tensors
+        
+    Notes:
+        - All scalar/list values are automatically converted to tensors with shape [1, 1, ...]
+        - Emotion vector is automatically normalized to sum to 1.0
+        - Language is converted to integer ID using supported language codes
+        - Unconditional keys are removed from the final dictionary
     """
     cond_dict = {
         "espeak": ([text], [language]),
