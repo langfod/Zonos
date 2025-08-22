@@ -1,6 +1,5 @@
 import json
 import logging
-import hashlib
 from typing import Callable
 
 import safetensors
@@ -10,11 +9,33 @@ from huggingface_hub import hf_hub_download
 
 from zonos.autoencoder import DACAutoencoder, preload_dac_autoencoder
 from zonos.backbone import BACKBONES
-from zonos.codebook_pattern import apply_delay_pattern, revert_delay_pattern
 from zonos.conditioning import PrefixConditioner
 from zonos.config import InferenceParams, ZonosConfig
 from zonos.sampling import sample_from_logits
-from zonos.utils import DEFAULT_DEVICE, find_multiple, pad_weight_
+from zonos.utilities.utils import DEFAULT_DEVICE, find_multiple, pad_weight_
+from zonos.utilities.conditioning_cache import ConditioningCache, prepare_conditioning_with_cache
+from zonos.utilities.tensor_ops import (
+    fused_frame_update, 
+    fused_parameter_updates, 
+    create_boolean_workspace,
+    create_comparison_workspace,
+    apply_eos_masking
+)
+from zonos.utilities.codec_utils import (
+    embed_codes_static,
+    apply_heads_static,
+    prepare_codec_input,
+    finalize_codec_output,
+    pad_embeddings_and_heads
+)
+from zonos.utilities.generation_utils import (
+    CUDAGraphManager,
+    decode_one_token_static,
+    prefill_static,
+    setup_inference_cache_static,
+    can_use_cudagraphs_static,
+    GenerationState
+)
 
 DEFAULT_BACKBONE_CLS = next(iter(BACKBONES.values()))
 
@@ -53,36 +74,26 @@ class Zonos(nn.Module):
         self.autoencoder: DACAutoencoder = preload_dac_autoencoder(device=DEFAULT_DEVICE, warmup=True)
         self.backbone = backbone_cls(config.backbone)
         self.prefix_conditioner = PrefixConditioner(config.prefix_conditioner, dim)
+        self._conditioning_cache = ConditioningCache(max_size=32)
         self._persistent_spk_model = None
         # 1024 (DAC vocab) + 1 (EOS) + 1 (MASK) = 1026.
         vocab_size = find_multiple(1026, 8)  # 1026 -> 1032
         self.embeddings = nn.ModuleList([nn.Embedding(vocab_size, dim) for _ in range(self.autoencoder.num_codebooks)])
         self.fused_heads = nn.Linear(dim, self.autoencoder.num_codebooks * 1025, bias=False)
-        self._cg_graph = None
-        self._cg_batch_size = None
-        self._cg_input_ids = None
-        self._cg_logits = None
-        self._cg_inference_params = None
-        self._cg_scale = None
+        self._cuda_graph_manager = CUDAGraphManager()
 
         if getattr(config, "pad_vocab_to_multiple_of", None):
             self.register_load_state_dict_post_hook(self._pad_embeddings_and_heads)
 
     # ---------------------------- Utility & Loading ----------------------------
     def _pad_embeddings_and_heads(self, *args, **kwargs):  # pragma: no cover (hook)
-        target_multiple = self.config.pad_vocab_to_multiple_of
-        if not target_multiple:
-            return
-        head_modules = []
-        if hasattr(self, "fused_heads"):
-            head_modules.append(self.fused_heads)
-        elif hasattr(self, "heads"):
-            head_modules.extend(self.heads)
-        for w in self.embeddings:
-            pad_weight_(w, target_multiple)
-        if hasattr(self, "heads"):
-            for w in self.heads:
-                pad_weight_(w, target_multiple)
+        """Pad embedding and head weights for vocabulary alignment."""
+        pad_embeddings_and_heads(
+            embeddings=self.embeddings,
+            fused_heads=self.fused_heads if hasattr(self, 'fused_heads') else None,
+            heads=self.heads if hasattr(self, 'heads') else None,
+            target_multiple=self.config.pad_vocab_to_multiple_of
+        )
 
     @property
     def device(self) -> torch.device:
@@ -178,21 +189,21 @@ class Zonos(nn.Module):
         Returns:
             torch.Tensor: Embedded codes of shape [batch, seq_len, d_model]
         """
-        return sum(emb(codes[:, i]) for i, emb in enumerate(self.embeddings))
+        return embed_codes_static(codes, self.embeddings)
 
     def apply_heads(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        # hidden_states: [B, 1, D]; fused linear -> [B,1,num_codebooks*V]
-        out = self.fused_heads(hidden_states)
-        B, one, prod = out.shape
-        num_codebooks = self.autoencoder.num_codebooks
-        if prod % num_codebooks != 0:
-            # Should not happen since we avoided padding fused head
-            raise RuntimeError(
-                f"Fused head output size {prod} not divisible by num_codebooks={num_codebooks}."
-            )
-        vocab = prod // num_codebooks
-        out = out.view(B, one, num_codebooks, vocab).transpose(1, 2)  # [B, num_codebooks, 1, vocab]
-        return out
+        """
+        Apply output heads to compute logits for each codebook position.
+        
+        Transforms hidden states into per-codebook logits using a fused linear layer.
+        
+        Args:
+            hidden_states (torch.Tensor): Hidden states of shape [batch, seq_len, d_model]
+            
+        Returns:
+            torch.Tensor: Logits of shape [batch, num_codebooks, seq_len, vocab_size]
+        """
+        return apply_heads_static(hidden_states, self.fused_heads, self.autoencoder.num_codebooks)
 
     def _load_from_state_dict(
         self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs
@@ -223,45 +234,35 @@ class Zonos(nn.Module):
         return logits
 
     # ---------------------------- Conditioning (with optional cache) -----------
-    def _create_conditioning_cache_key(self, cond_dict: dict, uncond_dict: dict | None) -> str:
-        def value_to_key(value):
-            if value is None:
-                return "None"
-            if isinstance(value, torch.Tensor):
-                return f"tensor_{tuple(value.shape)}_{value.dtype}_{hash(value.cpu().float().numpy().tobytes())}"
-            if isinstance(value, (int, float, str, bool)):
-                return str(value)
-            if isinstance(value, (list, tuple)):
-                return f"list_{[value_to_key(v) for v in value]}"
-            return f"other_{type(value).__name__}_{value}"
-        cond_items = sorted((k, value_to_key(v)) for k, v in cond_dict.items())
-        uncond_items = None if uncond_dict is None else sorted((k, value_to_key(v)) for k, v in uncond_dict.items())
-        cache_string = f"cond:{cond_items}_uncond:{uncond_items}"
-        return hashlib.sha512(cache_string.encode()).hexdigest()
-
     def prepare_conditioning(self, cond_dict: dict, uncond_dict: dict | None = None, use_cache: bool = False, cfg_scale: float = 1.0) -> torch.Tensor:  # type: ignore[override]
-        if not use_cache:
-            if cfg_scale == 1.0:
-                return self.prefix_conditioner(cond_dict)
-            if uncond_dict is None:
-                uncond_dict = {k: cond_dict[k] for k in self.prefix_conditioner.required_keys}
-            return torch.cat([self.prefix_conditioner(cond_dict), self.prefix_conditioner(uncond_dict)])
-        cache_key = self._create_conditioning_cache_key(cond_dict, uncond_dict)
-        if hasattr(self, "_conditioning_cache") and cache_key in self._conditioning_cache:
-            return self._conditioning_cache[cache_key]
-        if cfg_scale == 1.0:
-            conditioning = self.prefix_conditioner(cond_dict)
-        else:
-            if uncond_dict is None:
-                uncond_dict = {k: cond_dict[k] for k in self.prefix_conditioner.required_keys}
-            conditioning = torch.cat([self.prefix_conditioner(cond_dict), self.prefix_conditioner(uncond_dict)])
-        if not hasattr(self, "_conditioning_cache"):
-            self._conditioning_cache = {}
-        if len(self._conditioning_cache) >= 32:
-            oldest = next(iter(self._conditioning_cache))
-            del self._conditioning_cache[oldest]
-        self._conditioning_cache[cache_key] = conditioning
-        return conditioning
+        """
+        Prepare conditioning embeddings with optional caching.
+        
+        Processes conditioning dictionaries through the prefix conditioner with
+        optional caching to avoid recomputation of identical inputs.
+        
+        Args:
+            cond_dict (dict): Primary conditioning inputs
+            uncond_dict (dict, optional): Unconditional inputs for classifier-free guidance
+            use_cache (bool): Whether to use caching (default: False)
+            cfg_scale (float): Classifier-free guidance scale (default: 1.0)
+            
+        Returns:
+            torch.Tensor: Processed conditioning embeddings
+            
+        Notes:
+            - Uses centralized conditioning cache utilities for consistency
+            - Cache is automatically managed with LRU eviction
+            - For CFG, concatenates conditional and unconditional embeddings
+        """
+        return prepare_conditioning_with_cache(
+            self.prefix_conditioner,
+            cond_dict=cond_dict,
+            uncond_dict=uncond_dict,
+            use_cache=use_cache,
+            cfg_scale=cfg_scale,
+            cache=self._conditioning_cache if use_cache else None
+        )
 
     def _decode_one_token(
         self,
@@ -271,44 +272,15 @@ class Zonos(nn.Module):
         allow_cudagraphs: bool = True,
     ) -> torch.Tensor:
         """Single-step decode with optional CUDA Graph capture."""
-        if cfg_scale == 1.0:
-            hidden_states = self.embed_codes(input_ids)
-            return self._compute_logits(hidden_states, inference_params, cfg_scale)
-
-        bsz = input_ids.size(0)
-        if not allow_cudagraphs or input_ids.device.type != "cuda":
-            hidden_states_local = self.embed_codes(input_ids)
-            hidden_states_local = hidden_states_local.repeat(2, 1, 1)
-            return self._compute_logits(hidden_states_local, inference_params, cfg_scale)
-
-        need_capture = (self._cg_graph is None) or (self._cg_batch_size != bsz)
-        if need_capture:
-            self._cg_graph = None
-            self._cg_batch_size = bsz
-            self._cg_inference_params = inference_params
-            self._cg_scale = cfg_scale
-
-            for _ in range(3):
-                hidden_states = self.embed_codes(input_ids)
-                hidden_states = hidden_states.repeat(2, 1, 1)
-                logits = self._compute_logits(hidden_states, inference_params, cfg_scale)
-
-            self._cg_input_ids = input_ids
-            self._cg_logits = torch.empty_like(logits)
-
-            g = torch.cuda.CUDAGraph()
-            def capture_region():
-                hidden_states_local = self.embed_codes(self._cg_input_ids)
-                hidden_states_local = hidden_states_local.repeat(2, 1, 1)
-                self._cg_logits = self._compute_logits(hidden_states_local, self._cg_inference_params, self._cg_scale)
-            with torch.cuda.graph(g):
-                capture_region()
-            self._cg_graph = g
-        else:
-            self._cg_input_ids.copy_(input_ids)
-
-        self._cg_graph.replay()
-        return self._cg_logits
+        return decode_one_token_static(
+            input_ids=input_ids,
+            inference_params=inference_params,
+            cfg_scale=cfg_scale,
+            embed_codes_fn=self.embed_codes,
+            compute_logits_fn=self._compute_logits,
+            cuda_graph_manager=self._cuda_graph_manager,
+            allow_cudagraphs=allow_cudagraphs
+        )
 
     def _prefill(
         self,
@@ -321,68 +293,14 @@ class Zonos(nn.Module):
         "Prefill" mode: we already have `prefix_hidden_states`, and we want
         to append new embeddings, then compute the logits.
         """
-        if cfg_scale != 1.0:
-            input_ids = input_ids.expand(prefix_hidden_states.shape[0], -1, -1)
-        hidden_states = torch.cat([prefix_hidden_states, self.embed_codes(input_ids)], dim=1)
-        return self._compute_logits(hidden_states, inference_params, cfg_scale)
-
-    def _fused_frame_update(
-        self,
-        delayed_codes: torch.Tensor,
-        offset: int, 
-        batch_size: int,
-        next_token: torch.Tensor,
-        unknown_token: int,
-        temp_mask_buffer: torch.Tensor = None
-    ) -> None:
-        """
-        
-        Combines frame extraction, masking, and assignment with contiguous memory operations
-        to reduce kernel launches and improve memory access patterns.
-        """
-        frame_slice = delayed_codes[..., offset: offset + 1]
-        if frame_slice.numel() > 0:
-            frame_view = frame_slice.view(batch_size, 9)
-            
-            if temp_mask_buffer is not None:
-                torch.eq(frame_view, unknown_token, out=temp_mask_buffer)
-                frame_view.copy_(torch.where(temp_mask_buffer, next_token, frame_view))
-            else:
-                unknown_mask = (frame_view == unknown_token)  # [B, 9]
-                frame_view.copy_(torch.where(unknown_mask, next_token, frame_view))
-
-    def _fused_parameter_updates(
-        self,
-        inference_params: InferenceParams,
-        remaining_steps: torch.Tensor,
-        step_idx: int,
-        cpu_step_counter: int = None
-    ) -> bool:
-        """
-        
-        Combines multiple parameter updates and early termination check
-        to reduce kernel launches and improve efficiency. Minimizes CPU-GPU 
-        synchronization by using CPU-side counters for most checks.
-        
-        Returns True if should break early, False otherwise.
-        """
-        inference_params.seqlen_offset += 1
-        inference_params.lengths_per_sample.add_(1)
-        remaining_steps.sub_(1)
-        
-        should_check_16 = (step_idx % 16 == 15)
-        should_check_8 = (step_idx % 8 == 7)
-        
-        if should_check_16:
-            if (remaining_steps <= 0).all():
-                return True
-        elif should_check_8 and cpu_step_counter is not None:
-            estimated_remaining = max(0, len(remaining_steps) * 10 - cpu_step_counter)
-            if estimated_remaining < 5:
-                if (remaining_steps <= 0).all():
-                    return True
-        
-        return False
+        return prefill_static(
+            prefix_hidden_states=prefix_hidden_states,
+            input_ids=input_ids,
+            inference_params=inference_params,
+            cfg_scale=cfg_scale,
+            embed_codes_fn=self.embed_codes,
+            compute_logits_fn=self._compute_logits
+        )
 
     def setup_cache(self, batch_size: int, max_seqlen: int, dtype: torch.dtype = torch.bfloat16) -> InferenceParams:
         """
@@ -404,6 +322,16 @@ class Zonos(nn.Module):
             - Cache allocation is backend-specific (attention vs mamba)
             - Length tracking is initialized to zero for all samples
         """
+        return setup_inference_cache_static(
+            backbone_allocate_fn=lambda bs, ml, dt, dev: self._allocate_cache_helper(bs, ml, dt),
+            batch_size=batch_size,
+            max_seqlen=max_seqlen,
+            dtype=dtype,
+            device=self.device
+        )
+    
+    def _allocate_cache_helper(self, batch_size: int, max_seqlen: int, dtype: torch.dtype) -> InferenceParams:
+        """Helper method to maintain cache allocation logic."""
         max_seqlen = find_multiple(max_seqlen, 8)
         key_value_memory_dict = self.backbone.allocate_inference_cache(batch_size, max_seqlen, dtype=dtype)
         lengths_per_sample = torch.full((batch_size,), 0, dtype=torch.int32)
@@ -421,8 +349,7 @@ class Zonos(nn.Module):
             - Requires CUDA device 
             - CUDA graphs provide significant speedup for inference
         """
-        # Only the mamba-ssm backbone supports CUDA Graphs at the moment
-        return self.device.type == "cuda" and "_mamba_ssm" in str(self.backbone.__class__)
+        return can_use_cudagraphs_static(self.device, str(self.backbone.__class__))
 
     @torch.inference_mode()
     def generate(
@@ -489,7 +416,7 @@ class Zonos(nn.Module):
         if audio_prefix_codes is not None:
             codes[..., :prefix_audio_len] = audio_prefix_codes
 
-        delayed_codes = apply_delay_pattern(codes, self.masked_token_id)
+        delayed_codes = prepare_codec_input(codes, self.masked_token_id)
         delayed_prefix_audio_codes = delayed_codes[..., : prefix_audio_len + 1]
 
         logits = self._prefill(prefix_conditioning, delayed_prefix_audio_codes, inference_params, cfg_scale)
@@ -520,14 +447,14 @@ class Zonos(nn.Module):
         
         cb_mask_expanded = arange_codebooks.unsqueeze(0).expand(batch_size, -1)
         
-        boolean_workspace = torch.zeros((batch_size, 9, 3), dtype=torch.bool, device=device).contiguous()
+        # Use utility functions for workspace creation
+        boolean_workspace = create_boolean_workspace(batch_size, device)
+        comparison_workspace = create_comparison_workspace(batch_size, device)
         
         # Create views into the workspace for different mask types (eliminates separate allocations)
         mask_cond_1_buffer = boolean_workspace[..., 0]    # [B, 9]
         mask_cond_2_buffer = boolean_workspace[..., 1]    # [B, 9]
         temp_mask_buffer = boolean_workspace[..., 2]      # [B, 9] (for intermediate operations)
-        
-        comparison_workspace = torch.zeros((3, batch_size, 9), dtype=torch.bool, device=device).contiguous()
         
         temp_remaining_buffer = torch.zeros(batch_size, device=device)
         eos_idx_buffer = torch.zeros(batch_size, device=device)
@@ -561,27 +488,17 @@ class Zonos(nn.Module):
             torch.sub(nine_const, remaining_steps, out=eos_idx_buffer)
             eos_idx_buffer.clamp_(max=8)
 
-            eos_expanded = eos_idx_buffer.unsqueeze(1)  # [B, 1] - using buffer instead of eos_codebook_idx
-            stopping_expanded = stopping.unsqueeze(1)     # [B, 1]
-            
-            torch.eq(cb_mask_expanded, eos_expanded, out=comparison_workspace[0])
-            torch.lt(cb_mask_expanded, eos_expanded, out=comparison_workspace[1])
-            comparison_workspace[2] = stopping_expanded.expand(-1, 9)
-            
-            eos_pos_view = comparison_workspace[0]
-            before_eos_view = comparison_workspace[1] 
-            stop_mask_view = comparison_workspace[2]
-            
-            torch.logical_and(stop_mask_view, before_eos_view, out=mask_cond_1_buffer)
-            torch.logical_and(stop_mask_view, eos_pos_view, out=mask_cond_2_buffer)
-            
-            next_token = torch.where(mask_cond_1_buffer, self.masked_token_id, 
-                        torch.where(mask_cond_2_buffer, self.eos_token_id, next_token))
+            # Apply EOS masking using utility function
+            next_token = apply_eos_masking(
+                next_token, stopping, eos_idx_buffer, cb_mask_expanded,
+                comparison_workspace, mask_cond_1_buffer, mask_cond_2_buffer,
+                self.masked_token_id, self.eos_token_id
+            )
 
             if offset < delayed_codes.shape[2]:
-                self._fused_frame_update(delayed_codes, offset, batch_size, next_token, unknown_token, temp_mask_buffer)
+                fused_frame_update(delayed_codes, offset, batch_size, next_token, unknown_token, temp_mask_buffer)
 
-            should_break = self._fused_parameter_updates(inference_params, remaining_steps, step_idx, cpu_step_counter)
+            should_break = fused_parameter_updates(inference_params, remaining_steps, step_idx, cpu_step_counter)
             if should_break:
                 break
             
@@ -590,7 +507,7 @@ class Zonos(nn.Module):
             if callback is not None and not callback(frame if 'frame' in locals() else torch.empty(0), step, max_steps):
                 break
 
-        out_codes = revert_delay_pattern(delayed_codes)
+        out_codes = finalize_codec_output(delayed_codes)
         
         batch_size, num_codebooks, seq_len = out_codes.shape
         valid_length = offset - 9
