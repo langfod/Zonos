@@ -7,7 +7,7 @@ import logging
 from typing import Optional
 from zonos.model import Zonos
 from utilities.config_utils import is_online_model
-from zonos.speaker_cloning import SpeakerEmbeddingLDA
+from torch._inductor.utils import is_big_gpu
 
 CURRENT_MODEL_TYPE: Optional[str] = None
 CURRENT_MODEL: Optional[Zonos] = None
@@ -37,8 +37,18 @@ def load_model_if_needed(model_choice: str,
 
         if not disable_torch_compile:
             try:
+                if is_big_gpu():
+                    # High-end GPUs: most aggressive optimization
+                    compile_mode = "max-autotune"
+                else:
+                    # Mid/lower-end GPUs: balanced optimization
+                    #compile_mode = "reduce-overhead"
+                    compile_mode = "default"
+                
                 model.autoencoder.decode = torch.compile(
-                    model.autoencoder.decode, fullgraph=True
+                    model.autoencoder.decode, 
+                    fullgraph=True, 
+                    mode=compile_mode
                 )
             except Exception as e:
                 logging.info(f"Warning: Could not compile the autoencoder decoder. It will run unoptimized. Error: {e}")
