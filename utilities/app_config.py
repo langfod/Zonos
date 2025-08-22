@@ -78,8 +78,8 @@ class AppConfiguration:
     def get_model_paths(self) -> Tuple[str, str]:
         """Get the transformer and hybrid model paths"""
         return (
+            self.models["Zyphra/Zonos-v0.1-hybrid"],
             self.models["Zyphra/Zonos-v0.1-transformer"],
-            self.models["Zyphra/Zonos-v0.1-hybrid"]
         )
     
     def get_disable_torch_compile_default(self) -> bool:

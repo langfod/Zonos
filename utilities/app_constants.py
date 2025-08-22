@@ -33,6 +33,6 @@ class PerformanceConfig:
     
 class ModelConfig:
     """Model-related constants"""
-    DEFAULT_MODELS = {"Zyphra/Zonos-v0.1-hybrid", "Zyphra/Zonos-v0.1-transformer"}
+    DEFAULT_MODELS = {"Zyphra/Zonos-v0.1-transformer","Zyphra/Zonos-v0.1-hybrid"}
     CONFIG_FILE = "configmodel.txt"
     HF_HOME = "./models/hf_download"
