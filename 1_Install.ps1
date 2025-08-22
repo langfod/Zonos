@@ -8,29 +8,7 @@ Notes:
 - Uses Start-Process with -Wait for UI installers where necessary.
 #>
 
-function Print-Banner {
-    $banner = @'
-  ad88888ba   88                                 88                      888b      88                       
- d8"     "8b  88                                 ""                      8888b     88                ,d     
- Y8,          88                                                         88 `8b    88                88     
- `Y8aaaaa,    88   ,d8  8b       d8  8b,dPPYba,  88  88,dPYba,,adPYba,   88  `8b   88   ,adPPYba,  MM88MMM  
-   `""""""8b,  88 ,a8"   `8b     d8'  88P'   "Y8  88  88P'   "88"    "8a  88   `8b  88  a8P_____88    88     
-         `8b  8888[      `8b   d8'   88          88  88      88      88  88    `8b 88  8PP"""""""    88     
- Y8a     a8P  88`"Yba,    `8b,d8'    88          88  88      88      88  88     `8888  "8b,   ,aa    88,    
-  "Y88888P"   88   `Y8a     Y88'     88  _____   88  88      88      88  88      `888   `"Ybbd8"'    "Y888  
-                            d8'         |__  /___  _ __   ___  ___                                          
-                           d8'            / // _ \| '_ \ / _ \/ __|                                         
-                                         / /| (_) | | | | (_) \__ \                                         
-                                        /____\___/|_| |_|\___/|___/                                         
- #########################################################################################################  
- #                                                                                                       #  
- #  Checking for Python, eSpeak, and MS Build Tools                                                               #  
- #  You may need to accept installation windows and close them when they complete.                       #  
- #                                                                                                       #  
- #########################################################################################################  
-'@
-    Write-Host $banner
-}
+
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
@@ -52,7 +30,7 @@ function Test-WingetAvailable {
 }
 
 Clear-Host
-Print-Banner
+
 
 $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path","User")
 

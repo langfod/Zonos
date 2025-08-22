@@ -1,5 +1,5 @@
 
-Windows setup meant for use with SkyrimNet either locally (or local secondary PC) install of Zonos 
+Windows setup meant for use with either locally (or local secondary PC) install of Zonos 
 - should support Blackwell cards but not Ampere or below
 - cache files in `cache` folder
 - output files saved in `output_tmp` folder under process timestamp folders
@@ -35,7 +35,7 @@ Startup handled by 2_Start_Zonos:
 - Use virtual environment:
   - `.venv\Scripts\activate` or `.venv\Scripts\Activate.ps1` (for Powershell)
 - Run Zonos:
-  - python SkyrimNet-Zonos.py
+  - python Gradio-Zonos.py
 
 
 

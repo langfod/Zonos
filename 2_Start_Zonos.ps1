@@ -13,33 +13,6 @@ Notes:
 - This script uses cmd.exe start /high to set process priority (works on Windows 10).
 #>
 
-function Show-Banner {
-    $banner = @'
-  ad88888ba   88                                 88                      888b      88                       
- d8"     "8b  88                                 ""                      8888b     88                ,d     
- Y8,          88                                                         88 `8b    88                88     
- `Y8aaaaa,    88   ,d8  8b       d8  8b,dPPYba,  88  88,dPYba,,adPYba,   88  `8b   88   ,adPPYba,  MM88MMM  
-   `""""""8b,  88 ,a8"   `8b     d8'  88P'   "Y8  88  88P'   "88"    "8a  88   `8b  88  a8P_____88    88     
-         `8b  8888[      `8b   d8'   88          88  88      88      88  88    `8b 88  8PP"""""""    88     
- Y8a     a8P  88`"Yba,    `8b,d8'    88          88  88      88      88  88     `8888  "8b,   ,aa    88,    
-  "Y88888P"   88   `Y8a     Y88'     88  _____   88  88      88      88  88      `888   `"Ybbd8"'    "Y888  
-                            d8'         |__  /___  _ __   ___  ___                                          
-                           d8'            / // _ \| '_ \ / _ \/ __|                                         
-                                         / /| (_) | | | | (_) \__ \                                         
-                                        /____\___/|_| |_|\___/|___/                                         
-                                                                                                            
- #########################################################################################################  
- #                                                                                                       #  
- #  Checking for eSpeak and MS Build Tools                                                               #  
- #                                                                                                       #  
- # You may need to accept installation windows                                                           #  
- # and close them when they complete.                                                                    #  
- #                                                                                                       #  
- #########################################################################################################  
-'@
-
-    Write-Host $banner
-}
 
 function Invoke-Batch($batPath, $arguments) {
     if (-not (Test-Path $batPath)) {
@@ -68,7 +41,7 @@ function Any_Key_Wait {
 
 }
 Clear-Host
-Show-Banner
+
 
 # First attempt: vcvarsall.bat x64
 $vcvarsall = 'C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat'
@@ -82,7 +55,7 @@ Write-Host "`nIf there are errors above, read the messages then press Enter to c
 
 Any_Key_Wait 
 
-Write-Host "`nAttempting to start SkyrimNet Zonos..." -ForegroundColor Green
+Write-Host "`nAttempting to start Zonos..." -ForegroundColor Green
 
 # Locate python to run the project. Prefer venv python if present.
 $scriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Definition
@@ -104,7 +77,7 @@ if (Test-Path $venvPython) {
 }
 
 # Script to run (relative to repo root)
-$scriptToRun = Join-Path $scriptRoot 'skyrimnet-zonos.py'
+$scriptToRun = Join-Path $scriptRoot 'Gradio-zonos.py'
 if (-not (Test-Path $scriptToRun)) {
     Write-Host "Could not find script: $scriptToRun" -ForegroundColor Red
     Read-Host -Prompt "Press Enter to exit"
@@ -133,7 +106,7 @@ if ($vsLaunch) {
 }
 
 # Build the command to run inside the new PowerShell instance. Escape $Host so it's evaluated by the child PowerShell.
-$psCommand = "`$Host.UI.RawUI.WindowTitle = 'SkyrimNet Zonos'; $vsInitCommand & '$pythonPath' '$scriptToRun'"
+$psCommand = "`$Host.UI.RawUI.WindowTitle = 'Zonos'; $vsInitCommand & '$pythonPath' '$scriptToRun'"
 
 # Launch PowerShell in a new window and keep it open (-NoExit) so errors remain visible.
 $proc = Start-Process -FilePath 'powershell.exe' -ArgumentList @('-NoExit','-Command',$psCommand) -WorkingDirectory $scriptRoot -PassThru
@@ -145,6 +118,6 @@ try {
     Write-Host "Warning: failed to set process priority: $_" -ForegroundColor Yellow
 }
 
-Write-Host "`nSkyrimNet Zonos should start in another window." -ForegroundColor Green
+Write-Host "`nZonos should start in another window." -ForegroundColor Green
 Write-Host "If that window closes immediately, run $scriptToRun to capture errors." -ForegroundColor Yellow
 Any_Key_Wait -msg "Otherwise, you may close this window if it does not close itself.`n" -wait_sec 20

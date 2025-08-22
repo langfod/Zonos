@@ -1,5 +1,5 @@
 """
-Application constants for SkyrimNet-Zonos
+Application constants for Gradio-Zonos
 """
 
 class AudioGenerationConfig:
