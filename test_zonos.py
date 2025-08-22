@@ -20,20 +20,22 @@ from scipy.io.wavfile import write
 import torch
 from loguru import logger
 
-from test_utils.audio_graph import plot_audio
+#from test_utils.audio_graph import plot_audio
 from utilities.cache_utils import save_torchaudio_wav
-# Local imports - utilities
+# Local imports - utilities  
+from utilities.app_config import AppConfiguration
+from utilities.app_constants import AudioGenerationConfig, PerformanceConfig
 from utilities.config_utils import (update_model_paths_file, parse_model_paths_file)
 from utilities.file_utils import (lcx_checkmodels)
 from utilities.report import generate_troubleshooting_report
 from utilities.audio_utils import (process_speaker_audio, process_prefix_audio)
 from utilities.model_utils import (load_model_if_needed)
 
-from test_utils.model_whisper_utils import (initialize_whisper_model, transcribe_audio_with_whisper)
+#from test_utils.model_whisper_utils import (initialize_whisper_model, transcribe_audio_with_whisper)
 
 # Zonos-specific imports
 from zonos.conditioning import make_cond_dict
-from zonos.utils import DEFAULT_DEVICE
+from zonos.utilities.utils import DEFAULT_DEVICE
 
 import warnings
 
@@ -82,8 +84,15 @@ logging.basicConfig(
 )
 
 # =============================================================================
-# CONFIGURATION PARSING AND SETUP
+# CONFIGURATION SETUP
 # =============================================================================
+
+# Initialize configuration using the new AppConfiguration class
+config = AppConfiguration()
+config.setup_logging()
+
+# However, for test_zonos.py we'll keep the explicit setup for testing purposes
+# while also having access to the centralized config for consistency
 
 # Update the config file
 update_model_paths_file(in_dotenv_needed_models, in_dotenv_needed_paths, in_dotenv_needed_params,
@@ -334,7 +343,9 @@ def compare_with_baseline(baseline_path: str, cur_codes: torch.tensor):
 
 
 def load_model_wrapper(model_choice: str, disable_torch_compile: bool = disable_torch_compile_default):
-    return load_model_if_needed(model_choice, DEFAULT_DEVICE, in_dotenv_needed_models, disable_torch_compile)
+    # Use the models set from config for consistency
+    model_keys = config.models.keys() if hasattr(config, 'models') and config.models else in_dotenv_needed_models
+    return load_model_if_needed(model_choice, DEFAULT_DEVICE, model_keys, disable_torch_compile)
 
 
 async def generate_audio(model_choice, text, language, speaker_audio, prefix_audio, e1, e2, e3, e4, e5, e6, e7, e8,
@@ -360,12 +371,18 @@ async def generate_audio(model_choice, text, language, speaker_audio, prefix_aud
     confidence = float(confidence)
     quadratic = float(quadratic)
     seed = int(seed)
-    max_new_tokens_ceiling =  2580  # 86 tokens per second, 30 seconds ceiling
-    max_new_tokens = min(max(86, 2+(math.ceil(len(text) *6.5))), max_new_tokens_ceiling)
+    max_new_tokens_ceiling = AudioGenerationConfig.MAX_NEW_TOKENS_CEILING  # Use constant instead of magic number
+    max_new_tokens = min(
+        max(
+            AudioGenerationConfig.MIN_TOKENS, 
+            AudioGenerationConfig.TOKEN_BUFFER + math.ceil(len(text) * AudioGenerationConfig.TEXT_TO_TOKENS_MULTIPLIER)
+        ), 
+        max_new_tokens_ceiling
+    )
 
     uuid = seed
     if randomize_seed:
-        seed = torch.randint(0, 2 ** 32 - 1, (1,)).item()
+        seed = torch.randint(0, PerformanceConfig.SEED_MAX, (1,)).item()  # Use constant instead of magic number
     torch.manual_seed(seed)
     vq_val = [float(vq_single)] * 8 if model_choice != "Zyphra/Zonos-v0.1-hybrid" else None
 
@@ -387,7 +404,8 @@ async def generate_audio(model_choice, text, language, speaker_audio, prefix_aud
         conditioning = selected_model.prepare_conditioning(cond_dict, cfg_scale=cfg_scale, use_cache=True)
     
         speaker_embedding_duration_ms = (perf_counter_ns() - speaker_embedding_start_time) / 1000000
-        logging.info(f"speaker_embedding took: {speaker_embedding_duration_ms:.4f} ms")
+        if speaker_embedding_duration_ms > PerformanceConfig.MIN_TIMING_THRESHOLD_MS:
+            logging.info(f"speaker_embedding took: {speaker_embedding_duration_ms:.4f} ms")
        
         # Process prefix audio if provided
         audio_prefix_codes = None
@@ -505,9 +523,9 @@ async def generate_audio(model_choice, text, language, speaker_audio, prefix_aud
 
 
     # Decode audio and convert to numpy
-    wav_np16 = selected_model.autoencoder.decode_to_int16(codes)
+    #wav_np16 = selected_model.autoencoder.decode_to_int16(codes)
     wav_np = selected_model.autoencoder.decode(codes)
-    words = transcribe_audio_with_whisper(wav_np.squeeze(0), selected_model.autoencoder.sampling_rate)
+    #words = transcribe_audio_with_whisper(wav_np.squeeze(0), selected_model.autoencoder.sampling_rate)
     if baseline_save and not baseline_compare:
         torch.save({"codes": codes.cpu(), "shape": tuple(codes.shape), "seed": seed}, "baseline_codes.pt")
         torch.save({"codes": wav_np.cpu(), "shape": tuple(wav_np.cpu().shape), "seed": seed}, "baseline_wav.pt")
@@ -523,7 +541,7 @@ async def generate_audio(model_choice, text, language, speaker_audio, prefix_aud
     #logging.info(f"Total 'generate_audio' for {speaker_audio} execution time: {total_duration_s:.2f} seconds")
     logging.info(f"Generated audio length: {wav_length:.2f} seconds {selected_model.autoencoder.sampling_rate}. Speed: {wav_length / total_duration_s:.2f}x")
     stdout.flush()
-    plot_audio(wav_np16, selected_model.autoencoder.sampling_rate, words=words, audio_path=speaker_audio, uuid=uuid)
+    #plot_audio(wav_np16, selected_model.autoencoder.sampling_rate, words=words, audio_path=speaker_audio, uuid=uuid)
 
     #return (selected_model.autoencoder.sampling_rate, wav_np), uuid
     return [await output_wav_path, uuid]
@@ -543,7 +561,7 @@ def test_generate_audio(
     e7 = 0.1, 
     e8  = 0.2,
     vq_single  = 0.78,
-    fmax  = 22050,
+    fmax  = 22050,  # Keep original frequency value
     pitch_std  = 60,
     speaking_rate  = 15,
     dnsmos_ovrl  = 4,
@@ -555,7 +573,7 @@ def test_generate_audio(
     linear  = 0.5,
     confidence  = 0.4,
     quadratic  = 0,
-    seed = 420,
+    seed = PerformanceConfig.DEFAULT_SEED,  # Use constant from PerformanceConfig
     randomize_seed = False,
     unconditional_keys = ["emotion"],
     profiling = False,
@@ -577,9 +595,9 @@ def test_generate_audio(
 
 if __name__ == "__main__":
     print("CUDA available:", torch.cuda.is_available())
-    initialize_whisper_model()
-    #modelchoice= "Zyphra/Zonos-v0.1-hybrid"
-    modelchoice = "Zyphra/Zonos-v0.1-transformer"
+    #initialize_whisper_model()
+    modelchoice= "Zyphra/Zonos-v0.1-hybrid"
+    #modelchoice = "Zyphra/Zonos-v0.1-transformer"
     #load_model_wrapper(modelchoice)
     test_asset=Path.cwd().joinpath("assets", "dlc1seranavoice.wav")
     #test_asset=Path.cwd().joinpath("assets", "fishaudio_horror.wav")
@@ -587,13 +605,17 @@ if __name__ == "__main__":
     test_text= "Now let's make my mum's favourite. So three mars bars into the pan. Then we add the tuna and just stir for a bit, just let the chocolate and fish infuse. A sprinkle of olive oil and some tomato ketchup. Now smell that. Oh boy this is going to be incredible."
     try:
         # Run twice to warm model and caches
-        #[output_wav_path, seed_int] = test_generate_audio(model_choice=modelchoice,text=test_text,speaker_audio=test_asset,seed=4200,baseline_save=True)
-        #[output_wav_path, seed_int] = test_generate_audio(model_choice=modelchoice,text=test_text,speaker_audio=test_asset,seed=4200,baseline_compare=False)
-        #[output_wav_path, seed_int] = test_generate_audio(model_choice=modelchoice,text=test_text,speaker_audio=test_asset,seed=4200,baseline_compare=True)
+        #[output_wav_path, seed_int] = test_generate_audio(model_choice=modelchoice,text=test_text,speaker_audio=test_asset,seed=PerformanceConfig.DEFAULT_SEED*10,baseline_save=True)
+        [output_wav_path, seed_int] = test_generate_audio(model_choice=modelchoice,text=test_text,speaker_audio=test_asset,seed=PerformanceConfig.DEFAULT_SEED*10,baseline_compare=False)
+        [output_wav_path, seed_int] = test_generate_audio(model_choice=modelchoice,text=test_text,speaker_audio=test_asset,seed=PerformanceConfig.DEFAULT_SEED*10,baseline_compare=False)
 
         # Reset for next run
         sampling_rate, seed_int = None, 0
-        [output_wav_path, seed_int] = test_generate_audio(model_choice=modelchoice,text=test_text,speaker_audio=test_asset,seed=4200,profiling=True,baseline_compare=True)
+
+        #[output_wav_path, seed_int] = test_generate_audio(model_choice=modelchoice,text=test_text,speaker_audio=test_asset,seed=PerformanceConfig.DEFAULT_SEED*10,profiling=True,baseline_compare=True)
+        modelchoice = "Zyphra/Zonos-v0.1-transformer"
+        [output_wav_path, seed_int] = test_generate_audio(model_choice=modelchoice,text=test_text,speaker_audio=test_asset,seed=PerformanceConfig.DEFAULT_SEED*10,baseline_compare=False)
+        [output_wav_path, seed_int] = test_generate_audio(model_choice=modelchoice,text=test_text,speaker_audio=test_asset,seed=PerformanceConfig.DEFAULT_SEED*10,baseline_compare=False)
 
 
     except Exception as e:

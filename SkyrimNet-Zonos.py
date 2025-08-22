@@ -5,146 +5,96 @@ Zonos Text-to-Speech Application with Gradio Interface
 
 # Standard library imports
 import logging
-import math
-
 from argparse import ArgumentParser
-from os import environ as os_environ
-from sys import (stdout, platform, exit)
-from time import  perf_counter_ns
+from sys import exit, stdout
+from time import perf_counter_ns
 
 # Third-party imports
 import torch
 import gradio as gr
 
-from utilities.cache_utils import save_torchaudio_wav
-# Local imports - utilities
-from utilities.config_utils import (update_model_paths_file, parse_model_paths_file)
-from utilities.file_utils import (lcx_checkmodels)
+# Local imports
+from utilities.app_config import AppConfiguration
+from utilities.app_constants import UIConfig, PerformanceConfig
+from utilities.audio_generation_pipeline import (
+    prepare_generation_params, setup_speaker_conditioning, 
+    create_conditioning_dict, setup_prefix_audio,
+    create_progress_callback, generate_and_save_audio
+)
+from utilities.file_utils import lcx_checkmodels
+from utilities.gradio_utils import update_ui_visibility  
+from utilities.model_utils import load_model_if_needed, get_supported_models
 from utilities.report import generate_troubleshooting_report
-from utilities.audio_utils import (process_speaker_audio, process_prefix_audio)
-from utilities.model_utils import (load_model_if_needed, get_supported_models)
-from utilities.gradio_utils import (update_ui_visibility)
+from utilities.ui_components import (
+    create_model_and_text_controls, create_audio_controls,
+    create_conditioning_controls, create_generation_controls,
+    create_sampling_controls, create_advanced_controls, create_output_controls
+)
 
 # Zonos-specific imports
 from zonos.model import DEFAULT_BACKBONE_CLS as ZONOS_BACKBONE
-from zonos.conditioning import make_cond_dict, supported_language_codes
-from zonos.utils import DEFAULT_DEVICE
+from zonos.utilities.utils import DEFAULT_DEVICE
 
 # =============================================================================
-# GLOBAL CONFIGURATION AND CONSTANTS
+# APPLICATION SETUP
 # =============================================================================
 
-# Platform-specific defaults
-de_disable_torch_compile_default = False
-if platform == "linux":
-    de_disable_torch_compile_default = False
-if platform == "darwin":
-    de_disable_torch_compile_default = False
+# Initialize configuration
+config = AppConfiguration()
+config.setup_logging()
 
-# Model and path configuration
-in_dotenv_needed_models = {"Zyphra/Zonos-v0.1-hybrid", "Zyphra/Zonos-v0.1-transformer"}
-in_dotenv_needed_paths = {"HF_HOME": "./models/hf_download"}
-in_dotenv_needed_params = {
-    "DISABLE_TORCH_COMPILE_DEFAULT": de_disable_torch_compile_default,
-    "DEBUG_MODE": False
-}
-in_files_to_check_in_paths = []
+# Load configuration and models
+models_dict, models_values = config.load_configuration()
+AI_MODEL_DIR_TF, AI_MODEL_DIR_HY = config.get_model_paths()
+disable_torch_compile_default = config.get_disable_torch_compile_default()
 
-# Application configuration
-LCX_APP_NAME = "CROSSOS_FILE_CHECK"
-in_model_config_file = "configmodel.txt"
-
-# Dotenv prefixes
-PREFIX_MODEL = "PATH_MODEL_"
-PREFIX_PATH = "PATH_NEEDED_"
-LOG_PREFIX = "CROSSOS_LOG"
-
+# Enable TF32 for better performance on Ampere+ GPUs
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.benchmark = True  
+torch.set_float32_matmul_precision("medium")
 
 # =============================================================================
-# LOGGING AND DEVICE SETUP
+# COMMAND LINE ARGUMENT PARSING  
 # =============================================================================
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[logging.StreamHandler(stdout)]
-)
+def parse_arguments():
+    """Parse command line arguments"""
+    parser = ArgumentParser()
+    parser.add_argument('--share', action='store_true')
+    parser.add_argument("--server", type=str, default='0.0.0.0')
+    parser.add_argument("--port", type=int, required=False)
+    parser.add_argument("--inbrowser", action='store_true')
+    parser.add_argument("--output_dir", type=str, default='./outputs')
+    parser.add_argument("--checkmodels", action='store_true')
+    parser.add_argument("--integritycheck", action='store_true')
+    parser.add_argument("--sysreport", action='store_true')
+    return parser.parse_args()
+
+
+def handle_cli_options(args, config):
+    """Handle command line options that exit early"""
+    if args.checkmodels:
+        lcx_checkmodels(
+            config.models.keys(), config.paths, config.models,
+            models_values, []
+        )
+
+    if args.sysreport:
+        full_report = generate_troubleshooting_report(in_model_config_file=config.CONFIG_FILE)
+        print(full_report)
+        exit()
 
 # =============================================================================
-# CONFIGURATION PARSING AND SETUP
+# CORE APPLICATION FUNCTIONS
 # =============================================================================
-
-# Update the config file
-update_model_paths_file(in_dotenv_needed_models, in_dotenv_needed_paths, in_dotenv_needed_params,
-                        in_model_config_file, PREFIX_MODEL, PREFIX_PATH, LOG_PREFIX)
-
-# Read back the values
-out_dotenv_loaded_models, out_dotenv_loaded_paths, out_dotenv_loaded_params, out_dotenv_loaded_models_values = parse_model_paths_file(
-    in_model_config_file, in_dotenv_needed_models, in_dotenv_needed_paths, PREFIX_MODEL, PREFIX_PATH)
-debug_mode = out_dotenv_loaded_params["DEBUG_MODE"]
-if debug_mode:
-    print("Loaded models:", out_dotenv_loaded_models)
-    print("Loaded models values:", out_dotenv_loaded_models_values)
-    print("Loaded paths:", out_dotenv_loaded_paths)
-    print("Loaded params:", out_dotenv_loaded_params)
-
-# Set environment variables
-if "HF_HOME" in in_dotenv_needed_paths:
-    os_environ['HF_HOME'] = out_dotenv_loaded_paths["HF_HOME"]
-
-
-# =============================================================================
-# COMMAND LINE ARGUMENT PARSING
-# =============================================================================
-
-parser = ArgumentParser()
-parser.add_argument('--share', action='store_true')
-parser.add_argument("--server", type=str, default='0.0.0.0')
-parser.add_argument("--port", type=int, required=False)
-parser.add_argument("--inbrowser", action='store_true')
-parser.add_argument("--output_dir", type=str, default='./outputs')
-parser.add_argument("--checkmodels", action='store_true')
-parser.add_argument("--integritycheck", action='store_true')
-parser.add_argument("--sysreport", action='store_true')
-args = parser.parse_args()
-
-# Handle command line options
-if args.checkmodels:
-    lcx_checkmodels(in_dotenv_needed_models, out_dotenv_loaded_paths, out_dotenv_loaded_models,
-                    out_dotenv_loaded_models_values, in_files_to_check_in_paths)
-
-if args.sysreport:
-    full_report = generate_troubleshooting_report(in_model_config_file=in_model_config_file)
-    print(full_report)
-    exit()
-
-if debug_mode:
-    print("---current model paths---------")
-    for id in out_dotenv_loaded_models:
-        print(f"{id}: {out_dotenv_loaded_models[id]}")
-
-# Extract configuration values
-disable_torch_compile_default = out_dotenv_loaded_params["DISABLE_TORCH_COMPILE_DEFAULT"]
-AI_MODEL_DIR_TF = out_dotenv_loaded_models["Zyphra/Zonos-v0.1-transformer"]
-AI_MODEL_DIR_HY = out_dotenv_loaded_models["Zyphra/Zonos-v0.1-hybrid"]
-
-# =============================================================================
-# MAIN APPLICATION FUNCTIONS
-# =============================================================================
-ALLOW_TF32 = True         # enable TF32 matmul on Ampere+ for faster GEMMs with minimal quality loss
-
-if ALLOW_TF32:
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.backends.cudnn.benchmark = True
-    torch.set_float32_matmul_precision("medium")
 
 def load_model_wrapper(model_choice: str, disable_torch_compile: bool = disable_torch_compile_default):
-    return load_model_if_needed(model_choice, DEFAULT_DEVICE, in_dotenv_needed_models, disable_torch_compile)
+    """Wrapper for model loading"""
+    return load_model_if_needed(model_choice, DEFAULT_DEVICE, config.models.keys(), disable_torch_compile)
+
 
 def update_ui(model_choice, disable_torch_compile):
-    """
-    Dynamically show/hide UI elements based on the model's conditioners.
-    """
+    """Dynamically show/hide UI elements based on the model's conditioners"""
     model = load_model_wrapper(model_choice, disable_torch_compile)
     cond_names = [c.name for c in model.prefix_conditioner.conditioners]
     return update_ui_visibility(cond_names)
@@ -154,209 +104,113 @@ async def generate_audio(model_choice, text, language, speaker_audio, prefix_aud
                   vq_single, fmax, pitch_std, speaking_rate, dnsmos_ovrl, speaker_noised, cfg_scale, top_p,
                   top_k, min_p, linear, confidence, quadratic, seed, randomize_seed, unconditional_keys,
                   disable_torch_compile=disable_torch_compile_default, progress=gr.Progress(), do_progress=False):
-    """
-    Generates audio based on the provided UI parameters.
-    """
-    logging.info(f"Requested: \"{text}\"")
-    # Start timing the entire function
+    """Generate audio based on the provided UI parameters"""
+    logging.info(f'Requested: "{text}"')
+    
     func_start_time = perf_counter_ns()
-
-    # Time the model loading specifically
-    load_start_time = perf_counter_ns()
-    selected_model = load_model_wrapper(model_choice)
-    load_end_time = perf_counter_ns()
-    load_duration_ms = (load_end_time - load_start_time) / 1000000  # Convert to milliseconds
-    if load_duration_ms > 0.005:
-        logging.info(f"Model loading took: {load_duration_ms:.4f} ms")
-
-    # Convert parameters to appropriate types
-    speaker_noised_bool = bool(speaker_noised)
-    fmax = float(fmax)
-    pitch_std = float(pitch_std)
-    speaking_rate = float(speaking_rate)
-    dnsmos_ovrl = float(dnsmos_ovrl)
-    cfg_scale = float(cfg_scale)
-    top_p = float(top_p)
-    top_k = int(top_k)
-    min_p = float(min_p)
-    linear = float(linear)
-    confidence = float(confidence)
-    quadratic = float(quadratic)
-    seed = int(seed)
-    max_new_tokens_ceiling =  2580  # 86 tokens per second, 30 seconds ceiling
-    max_new_tokens = min(max(86, 2+(math.ceil(len(text) *6.5))), max_new_tokens_ceiling)
-
-    uuid = seed
-    if randomize_seed:
-        seed = torch.randint(0, 2 ** 32 - 1, (1,)).item()
-    torch.manual_seed(seed)
-
-    speaker_embedding_start_time = perf_counter_ns()
-    # Process speaker audio if provided
-    speaker_embedding = None
-    if speaker_audio is not None and "speaker" not in unconditional_keys:
-        speaker_embedding = process_speaker_audio(speaker_audio_path=speaker_audio, uuid=uuid, model=selected_model, device=DEFAULT_DEVICE,enable_disk_cache=True)
-
-    # Create conditioning dictionary
-    vq_val = [float(vq_single)] * 8 #if model_choice != "Zyphra/Zonos-v0.1-hybrid" else None
-    cond_dict = make_cond_dict(
-        text=text, language=language, speaker=await speaker_embedding if speaker_embedding is not None else None, emotion=[e1, e2, e3, e4, e5, e6, e7, e8],
-        vqscore_8=vq_val, fmax=fmax, pitch_std=pitch_std, speaking_rate=speaking_rate,
-        dnsmos_ovrl=dnsmos_ovrl, speaker_noised=speaker_noised_bool, device=DEFAULT_DEVICE,
-        unconditional_keys=unconditional_keys
+    
+    # Load model
+    selected_model = load_model_wrapper(model_choice, disable_torch_compile)
+    
+    # Prepare generation parameters
+    emotions = [e1, e2, e3, e4, e5, e6, e7, e8]
+    params = prepare_generation_params(
+        text=text, seed=seed, randomize_seed=randomize_seed,
+        speaker_noised=speaker_noised, vq_single=vq_single,
+        fmax=fmax, pitch_std=pitch_std, speaking_rate=speaking_rate,
+        dnsmos_ovrl=dnsmos_ovrl, cfg_scale=cfg_scale, top_p=top_p,
+        top_k=top_k, min_p=min_p, linear=linear, confidence=confidence,
+        quadratic=quadratic, disable_torch_compile=disable_torch_compile
     )
-    conditioning = selected_model.prepare_conditioning(cond_dict, cfg_scale=cfg_scale, use_cache=True)
-    speaker_embedding_duration_ms = (perf_counter_ns() - speaker_embedding_start_time) / 1000000
-    logging.info(f"speaker_embedding took: {speaker_embedding_duration_ms:.4f} ms")
-   
-    # Process prefix audio if provided
-    audio_prefix_codes = None
-    if prefix_audio is not None:
-        audio_prefix_codes = process_prefix_audio(prefix_audio_path=prefix_audio, model=selected_model, device=DEFAULT_DEVICE)
-
-    # Progress tracking
-    callback = None
-    if do_progress:
-        estimated_generation_duration = 30 * len(text) / 400
-        estimated_total_steps = int(estimated_generation_duration * 86)
-
-        def update_progress(_frame: torch.Tensor, step: int, _total_steps: int) -> bool:
-            progress((step, estimated_total_steps))
-            return True
-        callback = update_progress
-
-    # Generate audio codes
-    generate_start_time = perf_counter_ns()
-    codes = selected_model.generate(
-        prefix_conditioning=conditioning, audio_prefix_codes=await audio_prefix_codes if audio_prefix_codes is not None else None,
-        max_new_tokens=max_new_tokens, cfg_scale=cfg_scale, batch_size=1,
-        disable_torch_compile=disable_torch_compile,
-        sampling_params=dict(top_p=top_p, top_k=top_k, min_p=min_p, linear=linear, conf=confidence, quad=quadratic),
-        callback=callback
+    
+    uuid = params['seed']
+    
+    # Setup conditioning
+    speaker_embedding = await setup_speaker_conditioning(
+        speaker_audio, unconditional_keys, uuid, selected_model
     )
-    logging.info(f"'generate' took {(perf_counter_ns() - generate_start_time) /1000000:.4f} ms")
-    # Decode audio and convert to numpy
-    #wav_np = selected_model.autoencoder.decode_to_int16(codes)
-    wav_np = selected_model.autoencoder.decode(codes)
-    output_wav_path = save_torchaudio_wav(wav_np.squeeze(0), selected_model.autoencoder.sampling_rate, audio_path=speaker_audio,uuid=uuid)
-
-    # Log execution time
-    func_end_time = perf_counter_ns()
-    total_duration_s = (func_end_time - func_start_time)  / 1_000_000_000  # Convert nanoseconds to seconds
-    wav_length = wav_np.shape[-1]   / selected_model.autoencoder.sampling_rate
-    #wav_length = len(wav_np) / selected_model.autoencoder.sampling_rate
-    logging.info(f"Total 'generate_audio' for {speaker_audio} execution time: {total_duration_s:.2f} seconds")
-    logging.info(f"Generated audio length: {wav_length:.2f} seconds {selected_model.autoencoder.sampling_rate}. Speed: {wav_length / total_duration_s:.2f}x")
+    
+    cond_dict = create_conditioning_dict(
+        text, language, speaker_embedding, emotions, params, unconditional_keys
+    )
+    
+    conditioning = selected_model.prepare_conditioning(
+        cond_dict, cfg_scale=params['cfg_scale'], use_cache=True
+    )
+    
+    # Setup prefix audio
+    audio_prefix_codes = await setup_prefix_audio(prefix_audio, selected_model)
+    
+    # Setup progress callback
+    callback = create_progress_callback(do_progress, text, progress)
+    
+    # Generate and save audio
+    output_wav_path, wav_length = generate_and_save_audio(
+        selected_model, conditioning, params, audio_prefix_codes, 
+        callback, speaker_audio, uuid
+    )
+    
+    # Log performance
+    total_duration_s = (perf_counter_ns() - func_start_time) / 1_000_000_000
+    logging.info(f"Total 'generate_audio' execution time: {total_duration_s:.2f} seconds")
+    logging.info(f"Generated audio length: {wav_length:.2f} seconds. Speed: {wav_length / total_duration_s:.2f}x")
     stdout.flush()
 
-    #return (selected_model.autoencoder.sampling_rate, wav_np), uuid
     return [await output_wav_path, uuid]
 
 def build_interface():
-    """Build and return the Gradio interface."""
+    """Build and return the Gradio interface"""
     supported_models = get_supported_models(ZONOS_BACKBONE, AI_MODEL_DIR_HY, AI_MODEL_DIR_TF)
 
     with gr.Blocks(analytics_enabled=False) as demo:
+        # Create UI components using modular functions
         with gr.Row():
-            with gr.Column():
-                model_choice = gr.Dropdown(choices=supported_models, value=supported_models[0],
-                    label="Zonos Model Selection")
-                text = gr.Textbox(label="Text to Synthesize",
-                    value="Zonos uses eSpeak for text to phoneme conversion!",
-                    lines=4, max_length=500)
-                language = gr.Dropdown(choices=supported_language_codes, value="en-us", label="Language Code")
-            prefix_audio = gr.Audio(value="assets/silence_100ms.wav",
-                label="Optional Prefix Audio (continue from this audio)", type="filepath")
-            with gr.Column():
-                speaker_audio = gr.Audio(label="Optional Speaker Audio (for cloning)", type="filepath")
-                speaker_noised_checkbox = gr.Checkbox(label="Denoise Speaker? (only Hybrid model)", value=False)
+            model_choice, text, language = create_model_and_text_controls(supported_models)
+            prefix_audio, speaker_audio, speaker_noised_checkbox = create_audio_controls()
 
         with gr.Row():
-            with gr.Column():
-                gr.Markdown("## Conditioning Parameters")
-                dnsmos_slider = gr.Slider(1.0, 5.0, value=4.0, step=0.1, label="DNSMOS Overall")
-                fmax_slider = gr.Slider(0, 24000, value=24000, step=1,
-                                        label="Fmax (Hz) (T+H) Use 22050 for voice cloning")
-                vq_single_slider = gr.Slider(0.5, 0.8, 0.78, 0.01, label="VQ Score")
-                pitch_std_slider = gr.Slider(0.0, 300.0, value=45.0, step=1,
-                                             label="Pitch Std deviation. Controls Tone: normal(20-45) or expressive (60-150)")
-                speaking_rate_slider = gr.Slider(5.0, 30.0, value=15.0, step=0.5, label="Speaking Rate")
+            dnsmos_slider, fmax_slider, vq_single_slider, pitch_std_slider, speaking_rate_slider = create_conditioning_controls()
+            cfg_scale_slider, seed_number, randomize_seed_toggle, disable_torch_compile = create_generation_controls(disable_torch_compile_default)
 
-            with gr.Column():
-                gr.Markdown("## Generation Parameters")
-                cfg_scale_slider = gr.Slider(1.0, 5.0, 2.0, 0.1, label="CFG Scale")
-                seed_number = gr.Number(label="Seed", value=420, precision=0)
-                with gr.Row():
-                    randomize_seed_toggle = gr.Checkbox(label="Randomize Seed (before generation)", value=True)
-                    disable_torch_compile = gr.Checkbox(label="Disable Torch Compile",
-                                                        info="Only Transformer Windows:To enable Compile you must start the app in a dev console",
-                                                        value=disable_torch_compile_default)
+        # Sampling controls
+        linear_slider, confidence_slider, quadratic_slider, top_p_slider, min_k_slider, min_p_slider = create_sampling_controls()
+        
+        # Advanced controls
+        unconditional_keys, emotions = create_advanced_controls()
+        
+        # Output controls
+        generate_button, output_audio = create_output_controls()
 
-        with gr.Accordion("Sampling", open=False):
-            with gr.Row():
-                with gr.Column():
-                    gr.Markdown("### NovelAi's unified sampler")
-                    linear_slider = gr.Slider(-2.0, 2.0, 0.5, 0.01,
-                                              label="Linear (set to 0 to disable unified sampling)",
-                                              info="High values make the output less random.")
-                    confidence_slider = gr.Slider(-2.0, 2.0, 0.40, 0.01, label="Confidence",
-                                                  info="Low values make random outputs more random.")
-                    quadratic_slider = gr.Slider(-2.0, 2.0, 0.00, 0.01, label="Quadratic",
-                                                 info="High values make low probablities much lower.")
-                with gr.Column():
-                    gr.Markdown("### Legacy sampling")
-                    top_p_slider = gr.Slider(0.0, 1.0, 0, 0.01, label="Top P")
-                    min_k_slider = gr.Slider(0.0, 1024, 0, 1, label="Min K")
-                    min_p_slider = gr.Slider(0.0, 1.0, 0, 0.01, label="Min P")
+        # Hidden progress control
+        do_progress = gr.Checkbox(label="Progress", value=False, visible=False)
 
-        with gr.Accordion("Advanced Parameters", open=False):
-            gr.Markdown("### Unconditional Toggles\n"
-                        "Checking a box will make the model ignore the corresponding conditioning value and make it unconditional.\n"
-                        'Practically this means the given conditioning feature will be unconstrained and "filled in automatically".')
-            with gr.Row():
-                unconditional_keys = gr.CheckboxGroup(
-                    ["speaker", "emotion", "vqscore_8", "fmax", "pitch_std", "speaking_rate", "dnsmos_ovrl",
-                        "speaker_noised", ], value=["emotion"], label="Unconditional Keys", )
+        # Event handlers
+        model_choice.change(
+            fn=update_ui, 
+            inputs=[model_choice, disable_torch_compile],
+            outputs=[text, language, speaker_audio, prefix_audio] + emotions + 
+                    [vq_single_slider, fmax_slider, pitch_std_slider, speaking_rate_slider,
+                     dnsmos_slider, speaker_noised_checkbox, unconditional_keys]
+        )
 
-            gr.Markdown("### Emotion Sliders\n"
-                        "Warning: The way these sliders work is not intuitive and may require some trial and error to get the desired effect.\n"
-                        "Certain configurations can cause the model to become unstable. Setting emotion to unconditional may help.")
-            with gr.Row():
-                emotion1 = gr.Slider(0.0, 1.0, 1.0, 0.05, label="Happiness")
-                emotion2 = gr.Slider(0.0, 1.0, 0.05, 0.05, label="Sadness")
-                emotion3 = gr.Slider(0.0, 1.0, 0.05, 0.05, label="Disgust")
-                emotion4 = gr.Slider(0.0, 1.0, 0.05, 0.05, label="Fear")
-            with gr.Row():
-                emotion5 = gr.Slider(0.0, 1.0, 0.05, 0.05, label="Surprise")
-                emotion6 = gr.Slider(0.0, 1.0, 0.05, 0.05, label="Anger")
-                emotion7 = gr.Slider(0.0, 1.0, 0.1, 0.05, label="Other")
-                emotion8 = gr.Slider(0.0, 1.0, 0.2, 0.05, label="Neutral")
+        demo.load(
+            fn=update_ui, 
+            inputs=[model_choice, disable_torch_compile],
+            outputs=[text, language, speaker_audio, prefix_audio] + emotions + 
+                    [vq_single_slider, fmax_slider, pitch_std_slider, speaking_rate_slider,
+                     dnsmos_slider, speaker_noised_checkbox, unconditional_keys]
+        )
 
-        with gr.Column():
-            generate_button = gr.Button("Generate Audio")
-            #output_audio = gr.Audio(label="Generated Audio", type="numpy", autoplay=True)
-            output_audio = gr.Audio(label="Generated Audio", type="filepath", autoplay=True)
-
-            #wav_out = gr.File(label="Output Audio", visible=False)
-
-        model_choice.change(fn=update_ui, inputs=[model_choice, disable_torch_compile],
-            outputs=[text, language, speaker_audio, prefix_audio, emotion1, emotion2, emotion3, emotion4, emotion5,
-                emotion6, emotion7, emotion8, vq_single_slider, fmax_slider, pitch_std_slider, speaking_rate_slider,
-                dnsmos_slider, speaker_noised_checkbox, unconditional_keys, ], )
-
-        demo.load(fn=update_ui, inputs=[model_choice, disable_torch_compile],
-            outputs=[text, language, speaker_audio, prefix_audio, emotion1, emotion2, emotion3, emotion4, emotion5,
-                emotion6, emotion7, emotion8, vq_single_slider, fmax_slider, pitch_std_slider, speaking_rate_slider,
-                dnsmos_slider, speaker_noised_checkbox, unconditional_keys, ], )
-
-        do_progress = gr.Checkbox(label="Randomize Seed (before generation)", value=False, visible=False)
-
-        generate_button.click(fn=generate_audio, concurrency_limit=2,
-            inputs=[model_choice, text, language, speaker_audio, prefix_audio, emotion1, emotion2, emotion3, emotion4,
-                emotion5, emotion6, emotion7, emotion8, vq_single_slider, fmax_slider, pitch_std_slider,
-                speaking_rate_slider, dnsmos_slider, speaker_noised_checkbox, cfg_scale_slider, top_p_slider,
-                min_k_slider, min_p_slider, linear_slider, confidence_slider, quadratic_slider, seed_number,
-                randomize_seed_toggle, unconditional_keys], outputs=[output_audio, seed_number], )
+        generate_button.click(
+            fn=generate_audio, 
+            concurrency_limit=UIConfig.GENERATION_CONCURRENCY_LIMIT,
+            inputs=[model_choice, text, language, speaker_audio, prefix_audio] + emotions +
+                   [vq_single_slider, fmax_slider, pitch_std_slider, speaking_rate_slider,
+                    dnsmos_slider, speaker_noised_checkbox, cfg_scale_slider, top_p_slider,
+                    min_k_slider, min_p_slider, linear_slider, confidence_slider, 
+                    quadratic_slider, seed_number, randomize_seed_toggle, unconditional_keys],
+            outputs=[output_audio, seed_number]
+        )
 
     return demo
 
@@ -366,7 +220,19 @@ def build_interface():
 # =============================================================================
 
 if __name__ == "__main__":
+    # Parse command line arguments
+    args = parse_arguments()
+    handle_cli_options(args, config)
+    
+    # Set up Gradio static paths and preload model
     gr.set_static_paths(paths=["assets/"])
-    load_model_wrapper("Zyphra/Zonos-v0.1-hybrid")
+    load_model_wrapper("Zyphra/Zonos-v0.1-transformer")
+    
+    # Build and launch interface
     demo = build_interface().queue()
-    demo.launch(server_name=args.server, server_port=args.port, share=args.share, inbrowser=args.inbrowser)
+    demo.launch(
+        server_name=args.server, 
+        server_port=args.port, 
+        share=args.share, 
+        inbrowser=args.inbrowser
+    )

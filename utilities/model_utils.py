@@ -38,18 +38,25 @@ def load_model_if_needed(model_choice: str,
         if not disable_torch_compile:
             try:
                 if is_big_gpu():
-                    # High-end GPUs: most aggressive optimization
-                    compile_mode = "max-autotune"
+                    # High-end GPUs: Use custom options for max performance but disable CUDA graphs
+                    # to avoid inference tensor inplace operation conflicts
+                    model.autoencoder.decode = torch.compile(
+                        model.autoencoder.decode, 
+                        fullgraph=True,
+                        options={
+                            "triton.cudagraphs": False,  # Disable CUDA graphs for this method
+                            "max_autotune": True,        # Enable max-autotune optimizations
+                            "epilogue_fusion": True,     # Enable operation fusion
+                            "max_autotune_pointwise": True  # Aggressive pointwise optimizations
+                        }
+                    )
                 else:
-                    # Mid/lower-end GPUs: balanced optimization
-                    #compile_mode = "reduce-overhead"
-                    compile_mode = "default"
-                
-                model.autoencoder.decode = torch.compile(
-                    model.autoencoder.decode, 
-                    fullgraph=True, 
-                    mode=compile_mode
-                )
+                    # Mid/lower-end GPUs: balanced optimization with default settings
+                    model.autoencoder.decode = torch.compile(
+                        model.autoencoder.decode, 
+                        fullgraph=True, 
+                        mode="default"
+                    )
             except Exception as e:
                 logging.info(f"Warning: Could not compile the autoencoder decoder. It will run unoptimized. Error: {e}")
 
