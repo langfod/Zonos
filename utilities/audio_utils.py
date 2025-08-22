@@ -15,12 +15,15 @@ from zonos.speaker_cloning import SpeakerEmbeddingLDA
 PREFIX_AUDIO_CACHE: Dict[str, torch.Tensor] = {}
 SPEAKER_CACHE: Dict[str, torch.Tensor] = {}
 spk_clone_model = None
+spk_clone_model_device = "cuda" #"cpu"
 
 def make_speaker_embedding(wav: torch.Tensor, sr: int) -> torch.Tensor:
     global spk_clone_model
     if spk_clone_model is None:
-        spk_clone_model = SpeakerEmbeddingLDA(device=torch.device("cpu"))
-    _, spk_embedding = spk_clone_model(wav.to(spk_clone_model.device), sr)
+        spk_clone_model = SpeakerEmbeddingLDA(device=torch.device(spk_clone_model_device))
+    if wav.device != spk_clone_model.device:
+        wav = wav.to(spk_clone_model.device)
+    _, spk_embedding = spk_clone_model(wav, sr)
     return spk_embedding.unsqueeze(0).bfloat16()
 
 async def process_speaker_audio(speaker_audio_path: str, uuid: int, model, device: torch.device, enable_disk_cache=True) -> torch.Tensor:
@@ -31,7 +34,12 @@ async def process_speaker_audio(speaker_audio_path: str, uuid: int, model, devic
     cache_key = get_cache_key(speaker_audio_path, uuid)
     if cache_key in SPEAKER_CACHE:
         logging.info("Reused cached speaker embedding (memory).")
-        return SPEAKER_CACHE[cache_key]
+        cached_embedding = SPEAKER_CACHE[cache_key]
+
+        if cached_embedding.device != device:
+            cached_embedding = cached_embedding.to(device)
+            SPEAKER_CACHE[cache_key] = cached_embedding
+        return cached_embedding
 
     if enable_disk_cache:
         speaker_embedding = load_from_disk(cache_key, "embeds", device=device)
@@ -56,7 +64,7 @@ async def process_speaker_audio(speaker_audio_path: str, uuid: int, model, devic
     if enable_disk_cache:
         threading.Thread(
             target=save_to_disk,
-            args=(cache_key, "embeds", speaker_embedding),
+            args=(cache_key, "embeds", speaker_embedding.cpu()),
             daemon=True
         ).start()
 
