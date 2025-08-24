@@ -23,7 +23,7 @@ from utilities.audio_generation_pipeline import (
 )
 from utilities.file_utils import lcx_checkmodels
 from utilities.gradio_utils import update_ui_visibility  
-from utilities.model_utils import load_model_if_needed, get_supported_models
+from utilities.model_utils import load_model_if_needed, get_supported_models, is_deepspeed_available
 from utilities.report import generate_troubleshooting_report
 from utilities.ui_components import (
     create_model_and_text_controls, create_audio_controls,
@@ -43,10 +43,19 @@ from zonos.utilities.utils import DEFAULT_DEVICE
 config = AppConfiguration()
 config.setup_logging()
 
+# Log DeepSpeed availability status
+if is_deepspeed_available():
+    logging.info("🚀 DeepSpeed acceleration available (optional)")
+else:
+    logging.info("ℹ️  DeepSpeed not available - using standard PyTorch optimizations")
+
 # Load configuration and models
 models_dict, models_values = config.load_configuration()
 AI_MODEL_DIR_TF, AI_MODEL_DIR_HY = config.get_model_paths()
 disable_torch_compile_default = config.get_disable_torch_compile_default()
+
+# Global DeepSpeed setting (will be set by command line args)
+enable_deepspeed_global = False
 
 # Enable TF32 for better performance on Ampere+ GPUs
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -68,6 +77,8 @@ def parse_arguments():
     parser.add_argument("--checkmodels", action='store_true')
     parser.add_argument("--integritycheck", action='store_true')
     parser.add_argument("--sysreport", action='store_true')
+    parser.add_argument("--deepspeed", action='store_true', 
+                        help='Enable DeepSpeed acceleration (requires DeepSpeed installation)')
     return parser.parse_args()
 
 
@@ -90,7 +101,14 @@ def handle_cli_options(args, config):
 
 def load_model_wrapper(model_choice: str, disable_torch_compile: bool = disable_torch_compile_default):
     """Wrapper for model loading"""
-    return load_model_if_needed(model_choice, DEFAULT_DEVICE, config.models.keys(), disable_torch_compile)
+    global enable_deepspeed_global
+    return load_model_if_needed(
+        model_choice, 
+        DEFAULT_DEVICE, 
+        config.models.keys(), 
+        disable_torch_compile,
+        enable_deepspeed=enable_deepspeed_global
+    )
 
 
 def update_ui(model_choice, disable_torch_compile):
@@ -125,6 +143,9 @@ async def generate_audio(model_choice, text, language, speaker_audio, prefix_aud
     
     uuid = params['seed']
     
+     # Setup prefix audio
+    audio_prefix_codes = setup_prefix_audio(prefix_audio, selected_model)
+    
     # Setup conditioning
     speaker_embedding = await setup_speaker_conditioning(
         speaker_audio, unconditional_keys, uuid, selected_model
@@ -138,15 +159,14 @@ async def generate_audio(model_choice, text, language, speaker_audio, prefix_aud
         cond_dict, cfg_scale=params['cfg_scale'], use_cache=True
     )
     
-    # Setup prefix audio
-    audio_prefix_codes = await setup_prefix_audio(prefix_audio, selected_model)
+   
     
     # Setup progress callback
     callback = create_progress_callback(do_progress, text, progress)
     
     # Generate and save audio
     output_wav_path, wav_length = generate_and_save_audio(
-        selected_model, conditioning, params, audio_prefix_codes, 
+        selected_model, conditioning, params, await audio_prefix_codes, 
         callback, speaker_audio, uuid
     )
     
@@ -224,15 +244,29 @@ if __name__ == "__main__":
     args = parse_arguments()
     handle_cli_options(args, config)
     
+    # Set global DeepSpeed preference
+    enable_deepspeed_global = args.deepspeed
+    
+    # Log DeepSpeed setting
+    if enable_deepspeed_global:
+        if is_deepspeed_available():
+            logging.info("🚀 DeepSpeed acceleration enabled via --deepspeed flag")
+        else:
+            logging.warning("⚠️ DeepSpeed requested but not available - falling back to standard mode")
+            enable_deepspeed_global = False
+    else:
+        logging.info("ℹ️ DeepSpeed acceleration disabled (use --deepspeed to enable)")
+    
     # Set up Gradio static paths and preload model
     gr.set_static_paths(paths=["assets/"])
     load_model_wrapper("Zyphra/Zonos-v0.1-transformer")
     
     # Build and launch interface
-    demo = build_interface().queue()
+    demo = build_interface().queue(api_open=True, default_concurrency_limit=40)
     demo.launch(
         server_name=args.server, 
         server_port=args.port, 
         share=args.share, 
-        inbrowser=args.inbrowser
+        inbrowser=args.inbrowser,
+        
     )

@@ -636,7 +636,10 @@ def make_cond_dict(
         if isinstance(v, (float, int, list)):
             v = torch.tensor(v)
         if isinstance(v, torch.Tensor):
-            cond_dict[k] = v.view(1, 1, -1).to(device)
+           v = v.view(1, 1, -1)
+           if v.device != device:
+               v = v.to(device)
+           cond_dict[k] = v
 
         if k == "emotion":
             cond_dict[k] /= cond_dict[k].sum(dim=-1)

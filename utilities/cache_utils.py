@@ -24,14 +24,14 @@ def get_process_creation_time():
     creation_timestamp = p.create_time()
     return datetime.datetime.fromtimestamp(creation_timestamp)
 
-@functools.cache
+@functools.lru_cache(1)
 def get_embed_cache_dir():
     """Get or create the conditionals cache directory"""
     cache_dir = Path("cache/embeds")
     cache_dir.mkdir(parents=True, exist_ok=True)
     return cache_dir
 
-@functools.cache
+@functools.lru_cache(1)
 def get_prefix_cache_dir():
     """Get or create the conditionals cache directory"""
     cache_dir = Path("cache/prefixes")

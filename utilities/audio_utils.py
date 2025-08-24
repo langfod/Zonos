@@ -100,7 +100,8 @@ async def process_prefix_audio(prefix_audio_path: str, model, device: torch.devi
     if wav_prefix.size(0) > 1:
         wav_prefix = wav_prefix.mean(dim=0, keepdim=True)
     wav_prefix = model.autoencoder.preprocess(wav_prefix, sr_prefix).unsqueeze(0)
-    wav_prefix = wav_prefix.to(device, non_blocking=True)
+    if wav_prefix.device != device:
+        wav_prefix = wav_prefix.to(device, non_blocking=True)
 
     with torch.no_grad():
         audio_prefix_codes = model.autoencoder.encode(wav_prefix)

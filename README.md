@@ -36,6 +36,8 @@ Startup handled by 2_Start_Zonos:
   - `.venv\Scripts\activate` or `.venv\Scripts\Activate.ps1` (for Powershell)
 - Run Zonos:
   - python SkyrimNet-Zonos.py
+  - Optional: Add `--deepspeed` for enhanced performance (requires DeepSpeed installation)
+  - See `DEEPSPEED_INTEGRATION.md` for details on optional acceleration
 
 
 

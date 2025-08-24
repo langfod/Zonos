@@ -20,7 +20,7 @@ from scipy.io.wavfile import write
 import torch
 from loguru import logger
 
-#from test_utils.audio_graph import plot_audio
+from test_utils.audio_graph import plot_audio
 from utilities.cache_utils import save_torchaudio_wav
 # Local imports - utilities  
 from utilities.app_config import AppConfiguration
@@ -29,9 +29,9 @@ from utilities.config_utils import (update_model_paths_file, parse_model_paths_f
 from utilities.file_utils import (lcx_checkmodels)
 from utilities.report import generate_troubleshooting_report
 from utilities.audio_utils import (process_speaker_audio, process_prefix_audio)
-from utilities.model_utils import (load_model_if_needed)
+from utilities.model_utils import (load_model_if_needed, is_deepspeed_available)
 
-#from test_utils.model_whisper_utils import (initialize_whisper_model, transcribe_audio_with_whisper)
+from test_utils.model_whisper_utils import (initialize_whisper_model, transcribe_audio_with_whisper)
 
 # Zonos-specific imports
 from zonos.conditioning import make_cond_dict
@@ -91,6 +91,12 @@ logging.basicConfig(
 config = AppConfiguration()
 config.setup_logging()
 
+# Log DeepSpeed availability status
+if is_deepspeed_available():
+    logging.info("🚀 DeepSpeed acceleration available (optional)")
+else:
+    logging.info("ℹ️  DeepSpeed not available - using standard PyTorch optimizations")
+
 # However, for test_zonos.py we'll keep the explicit setup for testing purposes
 # while also having access to the centralized config for consistency
 
@@ -112,6 +118,9 @@ if out_dotenv_loaded_params["DEBUG_MODE"]:
 if "HF_HOME" in in_dotenv_needed_paths:
     os_environ['HF_HOME'] = out_dotenv_loaded_paths["HF_HOME"]
 
+# Global DeepSpeed setting (will be set by command line args)
+enable_deepspeed_global = False
+
 
 # =============================================================================
 # COMMAND LINE ARGUMENT PARSING
@@ -126,6 +135,8 @@ parser.add_argument("--output_dir", type=str, default='./outputs')
 parser.add_argument("--checkmodels", action='store_true')
 parser.add_argument("--integritycheck", action='store_true')
 parser.add_argument("--sysreport", action='store_true')
+parser.add_argument("--deepspeed", action='store_true', 
+                    help='Enable DeepSpeed acceleration (requires DeepSpeed installation)')
 args = parser.parse_args()
 
 # Handle command line options
@@ -344,8 +355,15 @@ def compare_with_baseline(baseline_path: str, cur_codes: torch.tensor):
 
 def load_model_wrapper(model_choice: str, disable_torch_compile: bool = disable_torch_compile_default):
     # Use the models set from config for consistency
+    global enable_deepspeed_global
     model_keys = config.models.keys() if hasattr(config, 'models') and config.models else in_dotenv_needed_models
-    return load_model_if_needed(model_choice, DEFAULT_DEVICE, model_keys, disable_torch_compile)
+    return load_model_if_needed(
+        model_choice, 
+        DEFAULT_DEVICE, 
+        model_keys, 
+        disable_torch_compile,
+        enable_deepspeed=enable_deepspeed_global
+    )
 
 
 async def generate_audio(model_choice, text, language, speaker_audio, prefix_audio, e1, e2, e3, e4, e5, e6, e7, e8,
@@ -523,9 +541,9 @@ async def generate_audio(model_choice, text, language, speaker_audio, prefix_aud
 
 
     # Decode audio and convert to numpy
-    #wav_np16 = selected_model.autoencoder.decode_to_int16(codes)
+    wav_np16 = selected_model.autoencoder.decode_to_int16(codes)
     wav_np = selected_model.autoencoder.decode(codes)
-    #words = transcribe_audio_with_whisper(wav_np.squeeze(0), selected_model.autoencoder.sampling_rate)
+    words = transcribe_audio_with_whisper(wav_np.squeeze(0), selected_model.autoencoder.sampling_rate)
     if baseline_save and not baseline_compare:
         torch.save({"codes": codes.cpu(), "shape": tuple(codes.shape), "seed": seed}, "baseline_codes.pt")
         torch.save({"codes": wav_np.cpu(), "shape": tuple(wav_np.cpu().shape), "seed": seed}, "baseline_wav.pt")
@@ -541,7 +559,7 @@ async def generate_audio(model_choice, text, language, speaker_audio, prefix_aud
     #logging.info(f"Total 'generate_audio' for {speaker_audio} execution time: {total_duration_s:.2f} seconds")
     logging.info(f"Generated audio length: {wav_length:.2f} seconds {selected_model.autoencoder.sampling_rate}. Speed: {wav_length / total_duration_s:.2f}x")
     stdout.flush()
-    #plot_audio(wav_np16, selected_model.autoencoder.sampling_rate, words=words, audio_path=speaker_audio, uuid=uuid)
+    plot_audio(wav_np16, selected_model.autoencoder.sampling_rate, words=words, audio_path=speaker_audio, uuid=uuid)
 
     #return (selected_model.autoencoder.sampling_rate, wav_np), uuid
     return [await output_wav_path, uuid]
@@ -594,11 +612,24 @@ def test_generate_audio(
 # =============================================================================
 
 if __name__ == "__main__":
+    # Set global DeepSpeed preference
+    enable_deepspeed_global = args.deepspeed
+    
+    # Log DeepSpeed setting
+    if enable_deepspeed_global:
+        if is_deepspeed_available():
+            logging.info("🚀 DeepSpeed acceleration enabled via --deepspeed flag")
+        else:
+            logging.warning("⚠️ DeepSpeed requested but not available - falling back to standard mode")
+            enable_deepspeed_global = False
+    else:
+        logging.info("ℹ️ DeepSpeed acceleration disabled (use --deepspeed to enable)")
+    
     print("CUDA available:", torch.cuda.is_available())
-    #initialize_whisper_model()
-    modelchoice= "Zyphra/Zonos-v0.1-hybrid"
-    #modelchoice = "Zyphra/Zonos-v0.1-transformer"
-    #load_model_wrapper(modelchoice)
+    initialize_whisper_model()
+    #modelchoice= "Zyphra/Zonos-v0.1-hybrid"
+    modelchoice = "Zyphra/Zonos-v0.1-transformer"
+    load_model_wrapper(modelchoice)
     test_asset=Path.cwd().joinpath("assets", "dlc1seranavoice.wav")
     #test_asset=Path.cwd().joinpath("assets", "fishaudio_horror.wav")
     #test_text="Testing Text. This is great!"
@@ -607,15 +638,11 @@ if __name__ == "__main__":
         # Run twice to warm model and caches
         #[output_wav_path, seed_int] = test_generate_audio(model_choice=modelchoice,text=test_text,speaker_audio=test_asset,seed=PerformanceConfig.DEFAULT_SEED*10,baseline_save=True)
         [output_wav_path, seed_int] = test_generate_audio(model_choice=modelchoice,text=test_text,speaker_audio=test_asset,seed=PerformanceConfig.DEFAULT_SEED*10,baseline_compare=False)
-        [output_wav_path, seed_int] = test_generate_audio(model_choice=modelchoice,text=test_text,speaker_audio=test_asset,seed=PerformanceConfig.DEFAULT_SEED*10,baseline_compare=False)
+        [output_wav_path, seed_int] = test_generate_audio(model_choice=modelchoice,text=test_text,speaker_audio=test_asset,seed=PerformanceConfig.DEFAULT_SEED*10,baseline_compare=True)
 
         # Reset for next run
         sampling_rate, seed_int = None, 0
-
-        #[output_wav_path, seed_int] = test_generate_audio(model_choice=modelchoice,text=test_text,speaker_audio=test_asset,seed=PerformanceConfig.DEFAULT_SEED*10,profiling=True,baseline_compare=True)
-        modelchoice = "Zyphra/Zonos-v0.1-transformer"
-        [output_wav_path, seed_int] = test_generate_audio(model_choice=modelchoice,text=test_text,speaker_audio=test_asset,seed=PerformanceConfig.DEFAULT_SEED*10,baseline_compare=False)
-        [output_wav_path, seed_int] = test_generate_audio(model_choice=modelchoice,text=test_text,speaker_audio=test_asset,seed=PerformanceConfig.DEFAULT_SEED*10,baseline_compare=False)
+        #[output_wav_path, seed_int] = test_generate_audio(model_choice=modelchoice,text=test_text,speaker_audio=test_asset,seed=PerformanceConfig.DEFAULT_SEED*10,profiling=True,baseline_compare=False)
 
 
     except Exception as e:
