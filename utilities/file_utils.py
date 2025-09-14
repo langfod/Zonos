@@ -1,9 +1,13 @@
 """
 File system utilities for path checking and validation.
 """
+import datetime
 import os
+import functools
 from pathlib import Path
-from typing import List, Tuple, Dict, Set
+from typing import List, Tuple, Dict, Set, Any
+
+import psutil
 
 
 def count_existing_paths(paths: List[str]) -> Tuple[str, bool, bool, List[str]]:
@@ -193,3 +197,21 @@ def lcx_checkmodels(
         in_files_to_check_in_paths=in_files_to_check_in_paths
     )
     sys.exit()
+
+@functools.cache
+def get_process_creation_time():
+    """Get the process creation time as a datetime object"""
+    p = psutil.Process(os.getpid())
+    creation_timestamp = p.create_time()
+    return datetime.datetime.fromtimestamp(creation_timestamp)
+
+@functools.cache
+def get_cache_dir(cache_dir_str: str = None) -> Path:
+    """Get or create the conditionals cache directory"""
+    if cache_dir_str is not None:
+        cache_dir = Path(cache_dir_str)
+    else:
+        cache_dir = Path("cache").joinpath("embeddings")
+
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    return cache_dir
