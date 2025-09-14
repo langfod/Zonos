@@ -1,5 +1,6 @@
 
 Windows setup meant for use with SkyrimNet either locally (or local secondary PC) install of Zonos 
+- In SkyriNet UI highly suggest using "Zyphra/Zonos-v0.1-transformer" and disabling Random Seed
 - should support Blackwell cards but not Ampere or below
 - cache files in `cache` folder
 - output files saved in `output_tmp` folder under process timestamp folders
