@@ -90,7 +90,7 @@ def handle_cli_options(args, config):
 
 def load_model_wrapper(model_choice: str, disable_torch_compile: bool = disable_torch_compile_default):
     """Wrapper for model loading"""
-    return load_model_if_needed(model_choice, DEFAULT_DEVICE, config.models.keys(), disable_torch_compile=disable_torch_compile, reset_compiler=False)
+    return load_model_if_needed(model_choice, DEFAULT_DEVICE, config.models.keys(), disable_torch_compile=disable_torch_compile)
 
 
 def update_ui(model_choice, disable_torch_compile):
