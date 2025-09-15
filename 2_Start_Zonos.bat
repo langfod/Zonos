@@ -1,6 +1,2 @@
 @echo off
-
-echo Starting Zonos in new window...
-call .venv\scripts\activate.bat
-start "Zonos" /high python appzonos.py
-call .venv\Scripts\deactivate.bat
+call powershell -ExecutionPolicy Bypass -File 2_Start_Zonos.ps1

@@ -4,113 +4,90 @@ Audio processing utilities for Zonos application.
 import torch
 import torchaudio
 import logging
-from typing import Dict, Any, Tuple
-import numpy as np
 
+from utilities.cache_utils import (
+    get_cache_key, 
+    get_embed_cache_manager, 
+    get_prefix_cache_manager
+)
+from zonos.speaker_cloning import SpeakerEmbeddingLDA
+spk_clone_model = None
+spk_clone_model_device = "cuda" #"cpu"
 
-# Global cache for audio prefixes
-PREFIX_AUDIO_CACHE: Dict[str, torch.Tensor] = {}
+def make_speaker_embedding(wav: torch.Tensor, sr: int) -> torch.Tensor:
+    global spk_clone_model
+    if spk_clone_model is None:
+        spk_clone_model = SpeakerEmbeddingLDA(device=torch.device(spk_clone_model_device))
+    if wav.device != spk_clone_model.device:
+        wav = wav.to(spk_clone_model.device)
+    _, spk_embedding = spk_clone_model(wav, sr)
+    return spk_embedding.unsqueeze(0).bfloat16()
 
-
-def process_speaker_audio(speaker_audio_path: str, model, device: torch.device,
-                         speaker_cache: Dict[str, torch.Tensor], speaker_audio_uuid=None, model_choice: str = None) -> torch.Tensor:
+async def process_speaker_audio(speaker_audio_path: str, uuid: int, model, device: torch.device, enable_disk_cache=True) -> torch.Tensor:
     """
-    Process speaker audio and return speaker embedding with caching.
+    Process speaker audio and return speaker embedding.
+    Uses caching to avoid recomputing embeddings for the same audio.
     """
-    # Check legacy cache first for backward compatibility
-    if speaker_audio_path in speaker_cache:
-        logging.debug("Reused cached speaker embedding (legacy cache)")
-        return speaker_cache[speaker_audio_path]
+    cache_key = get_cache_key(speaker_audio_path, uuid)
+    speaker_cache = get_embed_cache_manager(device)
+    
+    # Check cache (memory first, then disk if enabled)
+    cached_embedding = speaker_cache.get(cache_key, auto_load=enable_disk_cache)
+    if cached_embedding is not None:
+        logging.info("Reused cached speaker embedding.")
+        if cached_embedding.device != device:
+            cached_embedding = cached_embedding.to(device)
+            # Update cache with device-corrected tensor
+            speaker_cache.set(cache_key, cached_embedding, save_to_disk_flag=False)
+        return cached_embedding
 
-    # Load and process audio
-    logging.debug("Computing speaker embedding with caching")
-    wav, sr = torchaudio.load(speaker_audio_path)
+    try:
+        wav, sr = torchaudio.load(speaker_audio_path, normalize=True)
+        if wav.size(0) > 1:  # mix to mono
+            wav = wav.mean(dim=0, keepdim=True)
+    except Exception as e:
+        logging.error(f"Failed to load speaker audio '{speaker_audio_path}': {e}")
+        raise
 
-    # Use enhanced caching if available and initialized
-    if hasattr(model, 'spk_clone_model') and model.spk_clone_model is not None:
-        _, speaker_embedding = model.spk_clone_model(
-            wav.to(model.spk_clone_model.device), sr,
-            audio_path=speaker_audio_path,
-            audio_uuid=speaker_audio_uuid,
-            model_choice=model_choice
-        )
-    else:
-        # Fallback to regular method (which will initialize spk_clone_model if needed)
-        speaker_embedding = model.make_speaker_embedding(wav, sr)
+    logging.info("Computing speaker embedding.")
 
-    speaker_embedding = speaker_embedding.to(device, dtype=torch.bfloat16)
+    with torch.no_grad():
+        speaker_embedding = make_speaker_embedding(wav, sr).detach()
 
-    # Store in legacy cache for backward compatibility
-    speaker_cache[speaker_audio_path] = speaker_embedding
+    if speaker_embedding.device != device:
+        speaker_embedding = speaker_embedding.to(device)
+    
+    # Cache the embedding (both memory and disk)
+    speaker_cache.set(cache_key, speaker_embedding, save_to_disk_flag=enable_disk_cache)
+
     return speaker_embedding
 
 
-def process_prefix_audio(prefix_audio_path: str, model, device: torch.device) -> torch.Tensor:
+async def process_prefix_audio(prefix_audio_path: str, model, device: torch.device, enable_disk_cache=True) -> torch.Tensor:
     """
-    Process prefix audio and return encoded audio codes with simple caching.
+    Process prefix audio and return encoded audio codes.
+    Uses global caching to avoid recomputing codes for the same audio.
     """
-    global PREFIX_AUDIO_CACHE
+    prefix_audio_cache_key = get_cache_key(prefix_audio_path)
+    prefix_cache = get_prefix_cache_manager(device)
+    
+    # Check cache (memory first, then disk if enabled)
+    cached_codes = prefix_cache.get(prefix_audio_cache_key, auto_load=enable_disk_cache)
+    if cached_codes is not None:
+        logging.info("Using cached audio prefix.")
+        return cached_codes
 
-    if prefix_audio_path in PREFIX_AUDIO_CACHE:
-        logging.debug("Using cached audio prefix")
-        return PREFIX_AUDIO_CACHE[prefix_audio_path]
-
-    logging.debug("Encoding and caching new audio prefix")
+    logging.info("Encoding and caching new audio prefix.")
     wav_prefix, sr_prefix = torchaudio.load(prefix_audio_path)
-    wav_prefix = wav_prefix.mean(0, keepdim=True)
-    wav_prefix = model.autoencoder.preprocess(wav_prefix, sr_prefix)
-    wav_prefix = wav_prefix.to(device, dtype=torch.float32)
-    audio_prefix_codes = model.autoencoder.encode(wav_prefix.unsqueeze(0))
-    PREFIX_AUDIO_CACHE[prefix_audio_path] = audio_prefix_codes
+    if wav_prefix.size(0) > 1:
+        wav_prefix = wav_prefix.mean(dim=0, keepdim=True)
+    wav_prefix = model.autoencoder.preprocess(wav_prefix, sr_prefix).unsqueeze(0)
+    wav_prefix = wav_prefix.to(device, non_blocking=True)
+
+    with torch.no_grad():
+        audio_prefix_codes = model.autoencoder.encode(wav_prefix)
+
+    # Cache the codes (both memory and disk)
+    prefix_cache.set(prefix_audio_cache_key, audio_prefix_codes, save_to_disk_flag=enable_disk_cache)
+
     return audio_prefix_codes
-
-
-def convert_audio_to_numpy(wav_gpu_f32: torch.Tensor, sampling_rate: int) -> Tuple[int, np.ndarray]:
-    """Convert GPU tensor audio to numpy array for output."""
-    wav_gpu_i16 = (wav_gpu_f32.clamp(-1, 1) * 32767).to(torch.int16)
-    wav_np = wav_gpu_i16.cpu().squeeze().numpy()
-    return sampling_rate, wav_np
-
-
-def configure_speaker_cache(cache_dir: str = None, memory_cache_size: int = 100,
-                          enable_disk_cache: bool = True, cache_expiry_hours: float = 24 * 7) -> None:
-    """Configure the global speaker embedding cache system."""
-    try:
-        from utilities.speaker_cache import configure_global_cache
-        configure_global_cache(
-            cache_dir=cache_dir,
-            memory_cache_size=memory_cache_size,
-            enable_disk_cache=enable_disk_cache,
-            cache_expiry_hours=cache_expiry_hours
-        )
-        logging.info(f"Speaker cache configured: {cache_dir}")
-    except Exception as e:
-        logging.warning(f"Failed to configure speaker cache: {e}")
-
-
-def get_speaker_cache_stats() -> Dict[str, Any]:
-    """Get speaker embedding cache statistics."""
-    try:
-        from utilities.speaker_cache import get_global_speaker_cache
-        return get_global_speaker_cache().get_cache_stats()
-    except Exception:
-        return {"cache_available": False}
-
-
-def print_speaker_cache_stats() -> None:
-    """Print speaker embedding cache statistics."""
-    try:
-        from utilities.speaker_cache import get_global_speaker_cache
-        get_global_speaker_cache().print_cache_stats()
-    except Exception:
-        print("Speaker cache system not available")
-
-
-def clear_speaker_cache() -> None:
-    """Clear all speaker embedding caches."""
-    try:
-        from utilities.speaker_cache import get_global_speaker_cache
-        get_global_speaker_cache().clear_all_cache()
-        logging.info("Speaker cache cleared")
-    except Exception:
-        logging.warning("Speaker cache system not available")

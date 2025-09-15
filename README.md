@@ -1,3 +1,50 @@
+
+Windows setup meant for use with SkyrimNet either locally (or local secondary PC) install of Zonos 
+- In SkyriNet UI highly suggest using "Zyphra/Zonos-v0.1-transformer" and disabling Random Seed
+- should support Blackwell cards but not Ampere or below
+- cache files in `cache` folder
+- output files saved in `output_tmp` folder under process timestamp folders
+
+Assumes that [Python 3.12]([https://www.python.org/ftp/python/3.12.10/python-3.12.10-amd64.exe) is already installed. 
+
+To install other needed files:
+
+`1_Install.bat` or `1_Install.ps1`
+
+To run:
+
+`2_Start_Zonos.bat` or `2_Start_Zonos.ps1`
+
+This should start in a high priority process window.
+
+---
+
+Requirements that should be handled by 1_Install:
+
+- eSpeak
+- Windows Visual Studio x64 C++ Build Tools
+
+- Python 3.12 Virtual Environment
+  - py -3.12 -m venv .venv
+  - .venv\Scripts\activate
+  - pip install --upgrade pip
+  - pip install -r requirements.txt
+
+Startup handled by 2_Start_Zonos:
+- Either run from an x64 VS Tools Command Prompt or PowerShell or activate using the vcvars64.bat script:
+  - 'C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat'
+- Use virtual environment:
+  - `.venv\Scripts\activate` or `.venv\Scripts\Activate.ps1` (for Powershell)
+- Run Zonos:
+  - python SkyrimNet-Zonos.py
+
+
+
+---
+
+---
+
+
 # Zonos-v0.1
 
 <div align="center">
