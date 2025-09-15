@@ -35,8 +35,8 @@ def create_conditioning_cache_key(cond_dict: dict, uncond_dict: dict | None) -> 
         if value is None:
             return "None"
         if isinstance(value, torch.Tensor):
-            # Include tensor metadata and content hash
-            content_hash = hash(value.cpu().float().numpy().tobytes())
+            # Include tensor metadata and content hash (deterministic)
+            content_hash = hashlib.sha512(value.cpu().float().numpy().tobytes()).hexdigest()
             return f"tensor_{tuple(value.shape)}_{value.dtype}_{content_hash}"
         if isinstance(value, (int, float, str, bool)):
             return str(value)

@@ -15,6 +15,7 @@ def fused_frame_update(
     batch_size: int,
     next_token: torch.Tensor,
     unknown_token: int,
+    codebook_dimension: int,
     temp_mask_buffer: torch.Tensor = None
 ) -> None:
     """
@@ -29,18 +30,18 @@ def fused_frame_update(
         batch_size (int): Number of sequences being processed
         next_token (torch.Tensor): New tokens to assign [batch, codebooks]
         unknown_token (int): Sentinel value indicating unknown/masked positions
+        codebook_dimension (int): Number of codebooks in the autoencoder
         temp_mask_buffer (torch.Tensor, optional): Pre-allocated mask buffer [batch, codebooks]
             for memory-efficient operations. If None, allocates temporary mask.
             
     Notes:
         - Operates in-place on delayed_codes tensor
         - Uses provided buffer to avoid memory allocations when available
-        - Optimized for codebook dimension of 9 (DAC autoencoder)
         - Handles edge cases where frame slice is empty
     """
     frame_slice = delayed_codes[..., offset: offset + 1]
     if frame_slice.numel() > 0:
-        frame_view = frame_slice.view(batch_size, 9)
+        frame_view = frame_slice.view(batch_size, codebook_dimension)
         
         if temp_mask_buffer is not None:
             # Use pre-allocated buffer for memory efficiency
@@ -48,7 +49,7 @@ def fused_frame_update(
             frame_view.copy_(torch.where(temp_mask_buffer, next_token, frame_view))
         else:
             # Fallback to temporary allocation
-            unknown_mask = (frame_view == unknown_token)  # [B, 9]
+            unknown_mask = (frame_view == unknown_token)  # [B, codebook_dimension]
             frame_view.copy_(torch.where(unknown_mask, next_token, frame_view))
 
 
@@ -104,7 +105,7 @@ def fused_parameter_updates(
     return False
 
 
-def create_boolean_workspace(batch_size: int, device: torch.device) -> torch.Tensor:
+def create_boolean_workspace(batch_size: int, device: torch.device, codebook_dimension: int) -> torch.Tensor:
     """
     Create pre-allocated boolean workspace for mask operations.
     
@@ -114,9 +115,10 @@ def create_boolean_workspace(batch_size: int, device: torch.device) -> torch.Ten
     Args:
         batch_size (int): Number of sequences being processed
         device (torch.device): Target device for tensor allocation
+        codebook_dimension (int): Number of codebooks in the autoencoder
         
     Returns:
-        torch.Tensor: Boolean workspace of shape [batch, 9, 3] for mask operations
+        torch.Tensor: Boolean workspace of shape [batch, codebook_dimension, 3] for mask operations
         
     Notes:
         - Dimension 2 (size 3) provides space for different mask types:
@@ -124,12 +126,11 @@ def create_boolean_workspace(batch_size: int, device: torch.device) -> torch.Ten
           - Index 1: Conditional mask 2  
           - Index 2: Temporary operations buffer
         - Contiguous allocation improves memory access patterns
-        - Designed for codebook dimension of 9 (DAC autoencoder)
     """
-    return torch.zeros((batch_size, 9, 3), dtype=torch.bool, device=device).contiguous()
+    return torch.zeros((batch_size, codebook_dimension, 3), dtype=torch.bool, device=device).contiguous()
 
 
-def create_comparison_workspace(batch_size: int, device: torch.device) -> torch.Tensor:
+def create_comparison_workspace(batch_size: int, device: torch.device, codebook_dimension: int) -> torch.Tensor:
     """
     Create pre-allocated comparison workspace for tensor operations.
     
@@ -139,16 +140,16 @@ def create_comparison_workspace(batch_size: int, device: torch.device) -> torch.
     Args:
         batch_size (int): Number of sequences being processed
         device (torch.device): Target device for tensor allocation
+        codebook_dimension (int): Number of codebooks in the autoencoder
         
     Returns:
-        torch.Tensor: Comparison workspace of shape [3, batch, 9]
+        torch.Tensor: Comparison workspace of shape [3, batch, codebook_dimension]
         
     Notes:
         - Dimension 0 (size 3) provides space for different comparison types
         - Optimized memory layout for efficient tensor operations
-        - Designed for codebook dimension of 9 (DAC autoencoder)
     """
-    return torch.zeros((3, batch_size, 9), dtype=torch.bool, device=device).contiguous()
+    return torch.zeros((3, batch_size, codebook_dimension), dtype=torch.bool, device=device).contiguous()
 
 
 def apply_eos_masking(
@@ -160,7 +161,8 @@ def apply_eos_masking(
     mask_cond_1_buffer: torch.Tensor,
     mask_cond_2_buffer: torch.Tensor,
     masked_token_id: int,
-    eos_token_id: int
+    eos_token_id: int,
+    codebook_dimension: int
 ) -> torch.Tensor:
     """
     Apply end-of-sequence masking with pre-allocated buffers.
@@ -178,6 +180,7 @@ def apply_eos_masking(
         mask_cond_2_buffer (torch.Tensor): Buffer for condition 2 mask [batch, codebooks]
         masked_token_id (int): Token ID for masked positions
         eos_token_id (int): Token ID for end-of-sequence
+        codebook_dimension (int): Number of codebooks in the autoencoder
         
     Returns:
         torch.Tensor: Masked next tokens [batch, codebooks]
@@ -193,7 +196,7 @@ def apply_eos_masking(
     # Use comparison workspace views
     torch.eq(cb_mask_expanded, eos_expanded, out=comparison_workspace[0])
     torch.lt(cb_mask_expanded, eos_expanded, out=comparison_workspace[1])
-    comparison_workspace[2] = stopping_expanded.expand(-1, 9)
+    comparison_workspace[2] = stopping_expanded.expand(-1, codebook_dimension)
     
     eos_pos_view = comparison_workspace[0]
     before_eos_view = comparison_workspace[1] 

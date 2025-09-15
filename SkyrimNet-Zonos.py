@@ -90,7 +90,7 @@ def handle_cli_options(args, config):
 
 def load_model_wrapper(model_choice: str, disable_torch_compile: bool = disable_torch_compile_default):
     """Wrapper for model loading"""
-    return load_model_if_needed(model_choice, DEFAULT_DEVICE, config.models.keys(), disable_torch_compile)
+    return load_model_if_needed(model_choice, DEFAULT_DEVICE, config.models.keys(), disable_torch_compile=disable_torch_compile, reset_compiler=False)
 
 
 def update_ui(model_choice, disable_torch_compile):
@@ -135,7 +135,7 @@ async def generate_audio(model_choice, text, language, speaker_audio, prefix_aud
     )
     
     conditioning = selected_model.prepare_conditioning(
-        cond_dict, cfg_scale=params['cfg_scale'], use_cache=True
+        cond_dict, cfg_scale=params['cfg_scale'], use_cache=False
     )
     
     # Setup prefix audio
@@ -156,7 +156,7 @@ async def generate_audio(model_choice, text, language, speaker_audio, prefix_aud
     logging.info(f"Generated audio length: {wav_length:.2f} seconds. Speed: {wav_length / total_duration_s:.2f}x")
     stdout.flush()
 
-    return [await output_wav_path, uuid]
+    return [output_wav_path, uuid]
 
 def build_interface():
     """Build and return the Gradio interface"""

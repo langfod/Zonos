@@ -407,11 +407,11 @@ class Zonos(nn.Module):
 
         unknown_token = -1
         audio_seq_len = prefix_audio_len + max_new_tokens
-        seq_len = prefix_conditioning.shape[1] + audio_seq_len + 9
+        seq_len = prefix_conditioning.shape[1] + audio_seq_len + self.config.codebook_dimension
 
         with torch.device(device):
             inference_params = self.setup_cache(batch_size=batch_size * 2, max_seqlen=seq_len)
-            codes = torch.full((batch_size, 9, audio_seq_len), unknown_token)
+            codes = torch.full((batch_size, self.config.codebook_dimension, audio_seq_len), unknown_token)
 
         if audio_prefix_codes is not None:
             codes[..., :prefix_audio_len] = audio_prefix_codes
@@ -420,7 +420,7 @@ class Zonos(nn.Module):
         delayed_prefix_audio_codes = delayed_codes[..., : prefix_audio_len + 1]
 
         logits = self._prefill(prefix_conditioning, delayed_prefix_audio_codes, inference_params, cfg_scale)
-        next_token = sample_from_logits(logits, **sampling_params).squeeze(-1)  # [B,9]
+        next_token = sample_from_logits(logits, **sampling_params).squeeze(-1)  # [B,codebook_dim]
         offset = delayed_prefix_audio_codes.shape[2]
         frame = delayed_codes[..., offset: offset + 1]
 
@@ -442,19 +442,20 @@ class Zonos(nn.Module):
         cfg_scale_tensor = torch.tensor(cfg_scale)
 
         step = 0
-        nine_const = torch.tensor(9, device=device)
-        arange_codebooks = torch.arange(9, device=device)
+        codebook_dim = self.config.codebook_dimension
+        nine_const = torch.tensor(codebook_dim, device=device)
+        arange_codebooks = torch.arange(codebook_dim, device=device)
         
         cb_mask_expanded = arange_codebooks.unsqueeze(0).expand(batch_size, -1)
         
         # Use utility functions for workspace creation
-        boolean_workspace = create_boolean_workspace(batch_size, device)
-        comparison_workspace = create_comparison_workspace(batch_size, device)
+        boolean_workspace = create_boolean_workspace(batch_size, device, codebook_dim)
+        comparison_workspace = create_comparison_workspace(batch_size, device, codebook_dim)
         
         # Create views into the workspace for different mask types (eliminates separate allocations)
-        mask_cond_1_buffer = boolean_workspace[..., 0]    # [B, 9]
-        mask_cond_2_buffer = boolean_workspace[..., 1]    # [B, 9]
-        temp_mask_buffer = boolean_workspace[..., 2]      # [B, 9] (for intermediate operations)
+        mask_cond_1_buffer = boolean_workspace[..., 0]    # [B, codebook_dim]
+        mask_cond_2_buffer = boolean_workspace[..., 1]    # [B, codebook_dim]
+        temp_mask_buffer = boolean_workspace[..., 2]      # [B, codebook_dim] (for intermediate operations)
         
         temp_remaining_buffer = torch.zeros(batch_size, device=device)
         eos_idx_buffer = torch.zeros(batch_size, device=device)
@@ -492,11 +493,11 @@ class Zonos(nn.Module):
             next_token = apply_eos_masking(
                 next_token, stopping, eos_idx_buffer, cb_mask_expanded,
                 comparison_workspace, mask_cond_1_buffer, mask_cond_2_buffer,
-                self.masked_token_id, self.eos_token_id
+                self.masked_token_id, self.eos_token_id, codebook_dim
             )
 
             if offset < delayed_codes.shape[2]:
-                fused_frame_update(delayed_codes, offset, batch_size, next_token, unknown_token, temp_mask_buffer)
+                fused_frame_update(delayed_codes, offset, batch_size, next_token, unknown_token, codebook_dim, temp_mask_buffer)
 
             should_break = fused_parameter_updates(inference_params, remaining_steps, step_idx, cpu_step_counter)
             if should_break:
@@ -510,7 +511,7 @@ class Zonos(nn.Module):
         out_codes = finalize_codec_output(delayed_codes)
         
         batch_size, num_codebooks, seq_len = out_codes.shape
-        valid_length = offset - 9
+        valid_length = offset - self.config.codebook_dimension
         
         search_window = min(50, valid_length // 4)
         search_start = max(0, valid_length - search_window)
@@ -525,7 +526,7 @@ class Zonos(nn.Module):
             
             if eos_boundary is not None:
                 valid_length = eos_boundary
-                logging.info(f"Found EOS boundary at position {eos_boundary}, truncating sequence")
+                logging.debug(f"Found EOS boundary at position {eos_boundary}, truncating sequence")
 
         invalid_mask = out_codes > 1024
         eos_mask = out_codes == 1024
@@ -538,10 +539,10 @@ class Zonos(nn.Module):
         final_codes = torch.clamp(final_codes, 0, 1023)
 
         actual_new_tokens = offset - (prefix_audio_len + 1)
-        logging.info(f"Max Token: {max_new_tokens}. Actual decoded tokens (excluding prompt): {actual_new_tokens}")
-        logging.info(f"Final offset: {offset}, prefix_audio_len: {prefix_audio_len}")
-        logging.info(f"out_codes shape before slicing: {out_codes.shape}")
-        logging.info(f"final_codes shape: {final_codes.shape}")
+        logging.debug(f"Max Token: {max_new_tokens}. Actual decoded tokens (excluding prompt): {actual_new_tokens}")
+        logging.debug(f"Final offset: {offset}, prefix_audio_len: {prefix_audio_len}")
+        logging.debug(f"out_codes shape before slicing: {out_codes.shape}")
+        logging.debug(f"final_codes shape: {final_codes.shape}")
 
         self._cg_graph = None
         return final_codes

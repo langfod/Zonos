@@ -77,13 +77,11 @@ class logFbankCal(nn.Module):
             hop_length=int(hop_length * sample_rate),
             n_mels=n_mels,
         )
-        # Pre-compute for efficiency
-        self.register_buffer('eps', torch.tensor(1e-6))
 
     def forward(self, x):
         out = self.fbankCal(x)
-        # More memory-efficient computation
-        out = torch.log(out + self.eps)
+        # More memory-efficient computation with better numerical stability
+        out = torch.log1p(out)  # log(1 + out) for better stability near zero
         # One-line mean subtraction
         mean = out.mean(dim=2, keepdim=True)
         return out - mean

@@ -14,7 +14,7 @@ CURRENT_MODEL: Optional[Zonos] = None
 
 def load_model_if_needed(model_choice: str,
                         device: torch.device,
-                        needed_models: set, disable_torch_compile:bool = False) -> Zonos:
+                        needed_models: set, disable_torch_compile:bool = False, reset_compiler: bool = False) -> Zonos:
 
     global CURRENT_MODEL_TYPE, CURRENT_MODEL
 
@@ -26,7 +26,7 @@ def load_model_if_needed(model_choice: str,
 
         logging.info(f"Loading {model_choice} model...")
 
-        if is_online_model(model_choice, needed_models):
+        if is_online_model(model_choice, needed_models, debug_mode=False):
             model = Zonos.from_pretrained(model_choice, device=device.type)
         else:
             config_path = f"{model_choice}{os.sep}config.json"
@@ -57,6 +57,8 @@ def load_model_if_needed(model_choice: str,
                         fullgraph=True, 
                         mode="default"
                     )
+                if reset_compiler:
+                    torch.compiler.reset()
             except Exception as e:
                 logging.info(f"Warning: Could not compile the autoencoder decoder. It will run unoptimized. Error: {e}")
 

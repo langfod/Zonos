@@ -116,12 +116,14 @@ class ZonosConfig:
         eos_token_id (int): End-of-sequence token ID for generation termination
         masked_token_id (int): Token ID used for masked positions during generation  
         pad_vocab_to_multiple_of (int): Padding factor for vocabulary alignment
+        codebook_dimension (int): Number of codebooks in the audio autoencoder (default: 9 for DAC)
     """
     backbone: BackboneConfig
     prefix_conditioner: PrefixConditionerConfig
     eos_token_id: int = 1024
     masked_token_id: int = 1025
     pad_vocab_to_multiple_of: int = 8
+    codebook_dimension: int = 9  # DAC autoencoder default
 
     @classmethod
     def from_dict(cls, d: dict) -> "ZonosConfig":

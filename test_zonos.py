@@ -19,7 +19,7 @@ from pathlib import Path
 from scipy.io.wavfile import write
 import torch
 from loguru import logger
-
+import warnings
 #from test_utils.audio_graph import plot_audio
 from utilities.cache_utils import save_torchaudio_wav
 # Local imports - utilities  
@@ -30,28 +30,27 @@ from utilities.file_utils import (lcx_checkmodels)
 from utilities.report import generate_troubleshooting_report
 from utilities.audio_utils import (process_speaker_audio, process_prefix_audio)
 from utilities.model_utils import (load_model_if_needed)
+from utilities.audio_generation_pipeline import (
+    prepare_generation_params, setup_speaker_conditioning, 
+    create_conditioning_dict, setup_prefix_audio, generate_and_save_audio
+)
 
 #from test_utils.model_whisper_utils import (initialize_whisper_model, transcribe_audio_with_whisper)
 
 # Zonos-specific imports
 from zonos.conditioning import make_cond_dict
 from zonos.utilities.utils import DEFAULT_DEVICE
+import importlib
+skyrimnet_zonos = importlib.import_module("SkyrimNet-Zonos")
 
-import warnings
 
-# Filter out the specific UserWarning
-warnings.filterwarnings(
-    "ignore",
-    message="In 2.9, this function's implementation will be changed to use torchaudio.save_with_torchcodec",
-    category=UserWarning
-)
+
 # =============================================================================
 # GLOBAL CONFIGURATION AND CONSTANTS
 # =============================================================================
 
 # Platform-specific defaults
 de_disable_torch_compile_default = False
-
 
 # Model and path configuration
 in_dotenv_needed_models = {"Zyphra/Zonos-v0.1-hybrid", "Zyphra/Zonos-v0.1-transformer"}
@@ -62,9 +61,7 @@ in_dotenv_needed_params = {
 }
 in_files_to_check_in_paths = []
 
-# Application configuration
-#debug_mode = True
-LCX_APP_NAME = "CROSSOS_FILE_CHECK"
+# Configuration file
 in_model_config_file = "configmodel.txt"
 
 # Dotenv prefixes
@@ -90,6 +87,12 @@ logging.basicConfig(
 # Initialize configuration using the new AppConfiguration class
 config = AppConfiguration()
 config.setup_logging()
+
+# Load configuration and models (like SkyrimNet-Zonos.py does)
+models_dict, models_values = config.load_configuration()
+AI_MODEL_DIR_TF, AI_MODEL_DIR_HY = config.get_model_paths()
+disable_torch_compile_default = config.get_disable_torch_compile_default()
+
 
 # However, for test_zonos.py we'll keep the explicit setup for testing purposes
 # while also having access to the centralized config for consistency
@@ -143,10 +146,9 @@ if out_dotenv_loaded_params["DEBUG_MODE"]:
     for id in out_dotenv_loaded_models:
         print(f"{id}: {out_dotenv_loaded_models[id]}")
 
-# Extract configuration values
-disable_torch_compile_default = out_dotenv_loaded_params["DISABLE_TORCH_COMPILE_DEFAULT"]
-AI_MODEL_DIR_TF = out_dotenv_loaded_models["Zyphra/Zonos-v0.1-transformer"]
-AI_MODEL_DIR_HY = out_dotenv_loaded_models["Zyphra/Zonos-v0.1-hybrid"]
+# Configuration values are now loaded from config object above
+# disable_torch_compile_default = config.get_disable_torch_compile_default() - already set
+# AI_MODEL_DIR_TF, AI_MODEL_DIR_HY = config.get_model_paths() - already set
 
 # =============================================================================
 # MAIN APPLICATION FUNCTIONS
@@ -298,122 +300,90 @@ def summarize_profiler(prof: torch.profiler.profile, out_dir: str = "profile_log
     print(f"  Events with CUDA memory > 0: {len([op for op in memory_ops if op['cuda_mem_bytes'] > 0])}")
     print(f"  Events with CPU memory > 0: {len([op for op in memory_ops if op['cpu_mem_bytes'] > 0])}")
 
-def compare_with_baseline(baseline_path: str, cur_codes: torch.tensor):
-    if not Path(baseline_path).exists():
-        print(f"[compare] Baseline file not found: {baseline_path}")
-        return 2
-    ref = torch.load(baseline_path, map_location="cpu")
-    ref_codes = ref["codes"]
-    ref_shape = tuple(ref["shape"])
-    cur_shape = tuple(cur_codes.shape)
-    # Shape check
-    shape_ok = (cur_shape[0] == ref_shape[0] and cur_shape[1] == ref_shape[1] and (abs(cur_shape[2] - ref_shape[2])/ ref_shape[2]) < 0.0099)
-    print(f"[compare] baseline shape: {ref_shape} Current shape: {cur_shape} diff: {abs(cur_shape[2] - ref_shape[2])/ ref_shape[2]:.4f} PASS: {shape_ok}")
-    # Hamming distance ratio
-    min_len = min(ref_codes.shape[-1], cur_codes.shape[-1])
-    ref_trim = ref_codes[..., :min_len]
-    cur_trim = cur_codes[..., :min_len]
-    diff = (ref_trim != cur_trim).sum().item()
-    total = ref_trim.numel()
-    hamming_ratio = diff / total
-    # Token overlap (unique)
-    ref_set = set(ref_trim.reshape(-1).tolist())
-    cur_set = set(cur_trim.reshape(-1).tolist())
-    jaccard = len(ref_set & cur_set) / max(1, len(ref_set | cur_set))
-    # Simple summary slice
-    #sample_slice = min(32, min_len)
-    #ref_head = ref_trim[0, 0, :sample_slice].tolist()
-    #cur_head = cur_trim[0, 0, :sample_slice].tolist()
-    print(f"[compare] Hamming ratio: {hamming_ratio:.4f} (fraction of differing positions)")
-    print(f"[compare] Jaccard token overlap: {jaccard:.4f}")
-    #print(f"[compare] First {sample_slice} tokens (codebook 0):")
-    #print(f"          baseline: {ref_head}")
-    #print(f"          current : {cur_head}")
-    # Heuristic pass criteria:
-    # 1. Shape matches
-    # 2. Hamming ratio not extreme (allow up to 0.999 since sampling may vary heavily)
-    # 3. Some minimal overlap (Jaccard > 0.05)
-    passed = shape_ok and hamming_ratio < 0.999 and jaccard > 0.05
-    if passed:
-        print("[compare][PASS] Regression check passed.")
-        return 0
-    else:
-        print("[compare][FAIL] Regression check failed.")
-        return 1
+# compare_with_baseline function removed as it was not useful
 
 
-def load_model_wrapper(model_choice: str, disable_torch_compile: bool = disable_torch_compile_default):
-    # Use the models set from config for consistency
-    model_keys = config.models.keys() if hasattr(config, 'models') and config.models else in_dotenv_needed_models
-    return load_model_if_needed(model_choice, DEFAULT_DEVICE, model_keys, disable_torch_compile)
+# Use load_model_wrapper from skyrimnet_zonos module instead of duplicating
+# def load_model_wrapper(model_choice: str, disable_torch_compile: bool = disable_torch_compile_default):
+#     # Use the models set from config for consistency
+#     model_keys = config.models.keys() if hasattr(config, 'models') and config.models else in_dotenv_needed_models
+#     return load_model_if_needed(model_choice, DEFAULT_DEVICE, model_keys, disable_torch_compile)
 
 
-async def generate_audio(model_choice, text, language, speaker_audio, prefix_audio, e1, e2, e3, e4, e5, e6, e7, e8,
+async def generate_audio_test_wrapper(model_choice, text, language, speaker_audio, prefix_audio, e1, e2, e3, e4, e5, e6, e7, e8,
                   vq_single, fmax, pitch_std, speaking_rate, dnsmos_ovrl, speaker_noised, cfg_scale, top_p,
                   top_k, min_p, linear, confidence, quadratic, seed, randomize_seed, unconditional_keys,
-                  disable_torch_compile=disable_torch_compile_default, do_progress=False, profiling=False, baseline_save=False, baseline_compare=False):
+                  disable_torch_compile=disable_torch_compile_default, do_progress=False, profiling=False):
     """
-    Generates audio based on the provided UI parameters.
+    Test wrapper for generate_audio that adds profiling and memory tracking capabilities.
+    Uses the main skyrimnet_zonos.generate_audio function for most functionality.
     """
     func_start_time = perf_counter_ns()
     
-
-    speaker_noised_bool = bool(speaker_noised)
-    fmax = float(fmax)
-    pitch_std = float(pitch_std)
-    speaking_rate = float(speaking_rate)
-    dnsmos_ovrl = float(dnsmos_ovrl)
-    cfg_scale = float(cfg_scale)
-    top_p = float(top_p)
-    top_k = int(top_k)
-    min_p = float(min_p)
-    linear = float(linear)
-    confidence = float(confidence)
-    quadratic = float(quadratic)
-    seed = int(seed)
-    max_new_tokens_ceiling = AudioGenerationConfig.MAX_NEW_TOKENS_CEILING  # Use constant instead of magic number
-    max_new_tokens = min(
-        max(
-            AudioGenerationConfig.MIN_TOKENS, 
-            AudioGenerationConfig.TOKEN_BUFFER + math.ceil(len(text) * AudioGenerationConfig.TEXT_TO_TOKENS_MULTIPLIER)
-        ), 
-        max_new_tokens_ceiling
+    # For non-profiling runs, use the main generate_audio function
+    if not profiling:
+        # Import gradio Progress to match the signature
+        import gradio as gr
+        progress = gr.Progress()
+        return await skyrimnet_zonos.generate_audio(
+            model_choice, text, language, speaker_audio, prefix_audio, e1, e2, e3, e4, e5, e6, e7, e8,
+            vq_single, fmax, pitch_std, speaking_rate, dnsmos_ovrl, speaker_noised, cfg_scale, top_p,
+            top_k, min_p, linear, confidence, quadratic, seed, randomize_seed, unconditional_keys,
+            disable_torch_compile, progress, do_progress
+        )
+    
+    # For profiling, use the enhanced test version below
+    return await generate_audio_with_testing_features(
+        model_choice, text, language, speaker_audio, prefix_audio, e1, e2, e3, e4, e5, e6, e7, e8,
+        vq_single, fmax, pitch_std, speaking_rate, dnsmos_ovrl, speaker_noised, cfg_scale, top_p,
+        top_k, min_p, linear, confidence, quadratic, seed, randomize_seed, unconditional_keys,
+        disable_torch_compile, do_progress, profiling, func_start_time
     )
 
-    uuid = seed
-    if randomize_seed:
-        seed = torch.randint(0, PerformanceConfig.SEED_MAX, (1,)).item()  # Use constant instead of magic number
-    torch.manual_seed(seed)
+
+async def generate_audio_with_testing_features(model_choice, text, language, speaker_audio, prefix_audio, e1, e2, e3, e4, e5, e6, e7, e8,
+                  vq_single, fmax, pitch_std, speaking_rate, dnsmos_ovrl, speaker_noised, cfg_scale, top_p,
+                  top_k, min_p, linear, confidence, quadratic, seed, randomize_seed, unconditional_keys,
+                  disable_torch_compile=disable_torch_compile_default, do_progress=False, profiling=False, func_start_time=None):
+    """
+    Enhanced generate_audio function with profiling and memory tracking.
+    This function contains the test-specific code that can't be easily reused from the main function.
+    """
+    if func_start_time is None:
+        func_start_time = perf_counter_ns()
+
+    # Prepare generation parameters using the utility function
+    emotions = [e1, e2, e3, e4, e5, e6, e7, e8]
+    params = prepare_generation_params(
+        text=text, seed=seed, randomize_seed=randomize_seed,
+        speaker_noised=speaker_noised, vq_single=vq_single,
+        fmax=fmax, pitch_std=pitch_std, speaking_rate=speaking_rate,
+        dnsmos_ovrl=dnsmos_ovrl, cfg_scale=cfg_scale, top_p=top_p,
+        top_k=top_k, min_p=min_p, linear=linear, confidence=confidence,
+        quadratic=quadratic, disable_torch_compile=disable_torch_compile
+    )
+    
+    uuid = params['seed']
     vq_val = [float(vq_single)] * 8 if model_choice != "Zyphra/Zonos-v0.1-hybrid" else None
 
     if not profiling:
-        selected_model = load_model_wrapper(model_choice)
-        speaker_embedding_start_time = perf_counter_ns()
-        # Process speaker audio if provided
-        speaker_embedding = None
-        if speaker_audio is not None and "speaker" not in unconditional_keys:
-            speaker_embedding = process_speaker_audio(speaker_audio_path=speaker_audio, uuid=uuid, model=selected_model, device=DEFAULT_DEVICE,enable_disk_cache=True)
-    
-        # Create conditioning dictionary
-        cond_dict = make_cond_dict(
-            text=text, language=language, speaker=await speaker_embedding if speaker_embedding is not None else None, emotion=[e1, e2, e3, e4, e5, e6, e7, e8],
-            vqscore_8=vq_val, fmax=fmax, pitch_std=pitch_std, speaking_rate=speaking_rate,
-            dnsmos_ovrl=dnsmos_ovrl, speaker_noised=speaker_noised_bool, device=DEFAULT_DEVICE,
-            unconditional_keys=unconditional_keys
+        selected_model = skyrimnet_zonos.load_model_wrapper(model_choice)
+        
+        # Setup conditioning using utility functions
+        speaker_embedding = await setup_speaker_conditioning(
+            speaker_audio, unconditional_keys, uuid, selected_model
         )
-        conditioning = selected_model.prepare_conditioning(cond_dict, cfg_scale=cfg_scale, use_cache=True)
-    
-        speaker_embedding_duration_ms = (perf_counter_ns() - speaker_embedding_start_time) / 1000000
-        if speaker_embedding_duration_ms > PerformanceConfig.MIN_TIMING_THRESHOLD_MS:
-            logging.info(f"speaker_embedding took: {speaker_embedding_duration_ms:.4f} ms")
-       
-        # Process prefix audio if provided
-        audio_prefix_codes = None
-        if prefix_audio is not None:
-            audio_prefix_codes = process_prefix_audio(prefix_audio_path=prefix_audio, model=selected_model, device=DEFAULT_DEVICE)
-    
-        # Generate audio codes
-        generate_start_time = perf_counter_ns()
+        
+        cond_dict = create_conditioning_dict(
+            text, language, speaker_embedding, emotions, params, unconditional_keys
+        )
+        
+        conditioning = selected_model.prepare_conditioning(
+            cond_dict, cfg_scale=params['cfg_scale'], use_cache=True
+        )
+        
+        # Setup prefix audio
+        audio_prefix_codes = await setup_prefix_audio(prefix_audio, selected_model)
     
     # Track memory before generation
     if torch.cuda.is_available():
@@ -442,41 +412,33 @@ async def generate_audio(model_choice, text, language, speaker_audio, prefix_aud
             with torch.inference_mode():
                 torch.cuda.nvtx.range_push("infer_single")
 
-                selected_model = load_model_wrapper(model_choice)
+                selected_model = skyrimnet_zonos.load_model_wrapper(model_choice)
                 prof.step()
 
-                speaker_embedding_start_time = perf_counter_ns()
-                # Process speaker audio if provided
-                speaker_embedding = None
-                if speaker_audio is not None and "speaker" not in unconditional_keys:
-                    speaker_embedding = process_speaker_audio(speaker_audio_path=speaker_audio, uuid=uuid, model=selected_model, device=DEFAULT_DEVICE,enable_disk_cache=True)
-                    prof.step()
-                # Create conditioning dictionary
-                cond_dict = make_cond_dict(
-                    text=text, language=language, speaker=await speaker_embedding if speaker_embedding is not None else None, emotion=[e1, e2, e3, e4, e5, e6, e7, e8],
-                    vqscore_8=vq_val, fmax=fmax, pitch_std=pitch_std, speaking_rate=speaking_rate,
-                    dnsmos_ovrl=dnsmos_ovrl, speaker_noised=speaker_noised_bool, device=DEFAULT_DEVICE,
-                    unconditional_keys=unconditional_keys
+                # Setup conditioning using utility functions with profiling steps
+                speaker_embedding = await setup_speaker_conditioning(
+                    speaker_audio, unconditional_keys, uuid, selected_model
+                )
+                prof.step()
+                
+                cond_dict = create_conditioning_dict(
+                    text, language, speaker_embedding, emotions, params, unconditional_keys
                 )
                 prof.step()
 
-                conditioning = selected_model.prepare_conditioning(cond_dict, cfg_scale=cfg_scale, use_cache=True)
+                conditioning = selected_model.prepare_conditioning(cond_dict, cfg_scale=params['cfg_scale'], use_cache=False)
                 prof.step()
-
-                speaker_embedding_duration_ms = (perf_counter_ns() - speaker_embedding_start_time) / 1000000
-                #logging.info(f"speaker_embedding took: {speaker_embedding_duration_ms:.4f} ms")
                
                 # Process prefix audio if provided
-                audio_prefix_codes = None
-                if prefix_audio is not None:
-                    audio_prefix_codes = await process_prefix_audio(prefix_audio_path=prefix_audio, model=selected_model, device=DEFAULT_DEVICE)
-                    prof.step()
+                audio_prefix_codes = await setup_prefix_audio(prefix_audio, selected_model)
+                prof.step()
+                
                 # Generate audio codes
                 generate_start_time = perf_counter_ns()
 
                 codes = selected_model.generate(
                     prefix_conditioning=conditioning, audio_prefix_codes=audio_prefix_codes,
-                    max_new_tokens=max_new_tokens, cfg_scale=cfg_scale, batch_size=1,
+                    max_new_tokens=params['max_new_tokens'], cfg_scale=params['cfg_scale'], batch_size=1,
                     disable_torch_compile=disable_torch_compile,
                     sampling_params=dict(top_p=top_p, top_k=top_k, min_p=min_p, linear=linear,
                        conf=confidence, quad=quadratic), callback=callback
@@ -485,14 +447,13 @@ async def generate_audio(model_choice, text, language, speaker_audio, prefix_aud
                 prof.step()
                 codes = selected_model.generate(
                     prefix_conditioning=conditioning, audio_prefix_codes=audio_prefix_codes,
-                    max_new_tokens=max_new_tokens, cfg_scale=cfg_scale, batch_size=1,
+                    max_new_tokens=params['max_new_tokens'], cfg_scale=params['cfg_scale'], batch_size=1,
                     disable_torch_compile=disable_torch_compile,
                     sampling_params=dict(top_p=top_p, top_k=top_k, min_p=min_p, linear=linear,
                        conf=confidence, quad=quadratic), callback=callback
                 )
                 end2 = perf_counter_ns()
                 torch.cuda.nvtx.range_pop()
-        #torch.cuda.synchronize()  # flush kernels before exiting profiler
         logging.info(f"'generate1' took {(end1 - generate_start_time) /1000000:.4f} ms")
         logging.info(f"'generate2' took {(end2 - end1) /1000000:.4f} ms")
         summarize_profiler(prof, out_dir="profile_logs", topk=50)
@@ -511,40 +472,30 @@ async def generate_audio(model_choice, text, language, speaker_audio, prefix_aud
             if peak_mem > mem_before + 100:  # Spike of >100MB
                 print(f"⚠️  MEMORY SPIKE DETECTED: Peak was {peak_mem - mem_before:.1f} MB above starting memory")
     else:
+        generate_start_time = perf_counter_ns()  # Define timing start
         codes = selected_model.generate(
-                        prefix_conditioning=conditioning, audio_prefix_codes=await audio_prefix_codes if audio_prefix_codes is not None else None,
-                        max_new_tokens=max_new_tokens, cfg_scale=cfg_scale, batch_size=1,
+                        prefix_conditioning=conditioning, audio_prefix_codes=audio_prefix_codes,
+                        max_new_tokens=params['max_new_tokens'], cfg_scale=params['cfg_scale'], batch_size=1,
                         disable_torch_compile=disable_torch_compile,
-                        sampling_params=dict(top_p=top_p, top_k=top_k, min_p=min_p, linear=linear,
-                           conf=confidence, quad=quadratic)
+                        sampling_params=dict(top_p=params['top_p'], top_k=params['top_k'], min_p=params['min_p'], linear=params['linear'],
+                           conf=params['confidence'], quad=params['quadratic'])
                     )
         end = perf_counter_ns()
         logging.info(f"'generate' took {(end - generate_start_time) /1000000:.4f} ms")
 
-
     # Decode audio and convert to numpy
-    #wav_np16 = selected_model.autoencoder.decode_to_int16(codes)
     wav_np = selected_model.autoencoder.decode(codes)
-    #words = transcribe_audio_with_whisper(wav_np.squeeze(0), selected_model.autoencoder.sampling_rate)
-    if baseline_save and not baseline_compare:
-        torch.save({"codes": codes.cpu(), "shape": tuple(codes.shape), "seed": seed}, "baseline_codes.pt")
-        torch.save({"codes": wav_np.cpu(), "shape": tuple(wav_np.cpu().shape), "seed": seed}, "baseline_wav.pt")
-    if baseline_compare:
-        compare_with_baseline("baseline_codes.pt", codes.cpu())
-        compare_with_baseline("baseline_wav.pt", wav_np.cpu())
+    
     output_wav_path = save_torchaudio_wav(wav_np.squeeze(0), selected_model.autoencoder.sampling_rate, audio_path=speaker_audio,uuid=uuid)
-    # Log execution time
+    
+    # Log performance
     func_end_time = perf_counter_ns()
-    total_duration_s = (func_end_time - func_start_time)  / 1_000_000_000  # Convert nanoseconds to seconds
-    wav_length = wav_np.shape[-1]   / selected_model.autoencoder.sampling_rate
-    #wav_length = len(wav_np) / selected_model.autoencoder.sampling_rate
-    #logging.info(f"Total 'generate_audio' for {speaker_audio} execution time: {total_duration_s:.2f} seconds")
+    total_duration_s = (func_end_time - func_start_time) / 1_000_000_000  # Convert nanoseconds to seconds
+    wav_length = wav_np.shape[-1] / selected_model.autoencoder.sampling_rate
     logging.info(f"Generated audio length: {wav_length:.2f} seconds {selected_model.autoencoder.sampling_rate}. Speed: {wav_length / total_duration_s:.2f}x")
     stdout.flush()
-    #plot_audio(wav_np16, selected_model.autoencoder.sampling_rate, words=words, audio_path=speaker_audio, uuid=uuid)
 
-    #return (selected_model.autoencoder.sampling_rate, wav_np), uuid
-    return [await output_wav_path, uuid]
+    return [output_wav_path, uuid]
 
 def test_generate_audio(
     model_choice,
@@ -576,15 +527,12 @@ def test_generate_audio(
     seed = PerformanceConfig.DEFAULT_SEED,  # Use constant from PerformanceConfig
     randomize_seed = False,
     unconditional_keys = ["emotion"],
-    profiling = False,
-    baseline_save = False,
-    baseline_compare = False
-
+    profiling = False
 ):
-    return asyncio.run(generate_audio(model_choice, text, language, speaker_audio, prefix_audio, e1, e2, e3, e4, e5, e6, e7, e8,
+    return asyncio.run(generate_audio_test_wrapper(model_choice, text, language, speaker_audio, prefix_audio, e1, e2, e3, e4, e5, e6, e7, e8,
                   vq_single, fmax, pitch_std, speaking_rate, dnsmos_ovrl, speaker_noised, cfg_scale, top_p,
                   top_k, min_p, linear, confidence, quadratic, seed, randomize_seed, unconditional_keys,
-                  disable_torch_compile=disable_torch_compile_default, profiling=profiling, baseline_save=baseline_save, baseline_compare=baseline_compare))
+                  disable_torch_compile=disable_torch_compile_default, profiling=profiling))
 
 
 
@@ -596,26 +544,27 @@ def test_generate_audio(
 if __name__ == "__main__":
     print("CUDA available:", torch.cuda.is_available())
     #initialize_whisper_model()
-    modelchoice= "Zyphra/Zonos-v0.1-hybrid"
-    #modelchoice = "Zyphra/Zonos-v0.1-transformer"
-    #load_model_wrapper(modelchoice)
+    #modelchoice= "Zyphra/Zonos-v0.1-hybrid"
+    model_choice = "Zyphra/Zonos-v0.1-transformer"
+    model = skyrimnet_zonos.load_model_if_needed(model_choice, DEFAULT_DEVICE, config.models.keys(), disable_torch_compile=False,reset_compiler=True)
     test_asset=Path.cwd().joinpath("assets", "dlc1seranavoice.wav")
     #test_asset=Path.cwd().joinpath("assets", "fishaudio_horror.wav")
-    #test_text="Testing Text. This is great!"
-    test_text= "Now let's make my mum's favourite. So three mars bars into the pan. Then we add the tuna and just stir for a bit, just let the chocolate and fish infuse. A sprinkle of olive oil and some tomato ketchup. Now smell that. Oh boy this is going to be incredible."
+    test_text_short="Testing Text. This is great!"
+    test_text_long= "Now let's make my mum's favourite. So three mars bars into the pan. Then we add the tuna and just stir for a bit, just let the chocolate and fish infuse. A sprinkle of olive oil and some tomato ketchup. Now smell that. Oh boy this is going to be incredible."
     try:
         # Run twice to warm model and caches
-        #[output_wav_path, seed_int] = test_generate_audio(model_choice=modelchoice,text=test_text,speaker_audio=test_asset,seed=PerformanceConfig.DEFAULT_SEED*10,baseline_save=True)
-        [output_wav_path, seed_int] = test_generate_audio(model_choice=modelchoice,text=test_text,speaker_audio=test_asset,seed=PerformanceConfig.DEFAULT_SEED*10,baseline_compare=False)
-        [output_wav_path, seed_int] = test_generate_audio(model_choice=modelchoice,text=test_text,speaker_audio=test_asset,seed=PerformanceConfig.DEFAULT_SEED*10,baseline_compare=False)
+        #[output_wav_path, seed_int] = test_generate_audio(model_choice=modelchoice,text=test_text,speaker_audio=test_asset,seed=PerformanceConfig.DEFAULT_SEED*10)
+        #[output_wav_path, seed_int] = test_generate_audio(model_choice=modelchoice,text=test_text,speaker_audio=test_asset,seed=PerformanceConfig.DEFAULT_SEED*10)
+        #[output_wav_path, seed_int] = test_generate_audio(model_choice=modelchoice,text=test_text,speaker_audio=test_asset,seed=PerformanceConfig.DEFAULT_SEED*10)
 
         # Reset for next run
         sampling_rate, seed_int = None, 0
 
-        #[output_wav_path, seed_int] = test_generate_audio(model_choice=modelchoice,text=test_text,speaker_audio=test_asset,seed=PerformanceConfig.DEFAULT_SEED*10,profiling=True,baseline_compare=True)
+        #[output_wav_path, seed_int] = test_generate_audio(model_choice=modelchoice,text=test_text,speaker_audio=test_asset,seed=PerformanceConfig.DEFAULT_SEED*10,profiling=True)
         modelchoice = "Zyphra/Zonos-v0.1-transformer"
-        [output_wav_path, seed_int] = test_generate_audio(model_choice=modelchoice,text=test_text,speaker_audio=test_asset,seed=PerformanceConfig.DEFAULT_SEED*10,baseline_compare=False)
-        [output_wav_path, seed_int] = test_generate_audio(model_choice=modelchoice,text=test_text,speaker_audio=test_asset,seed=PerformanceConfig.DEFAULT_SEED*10,baseline_compare=False)
+        [output_wav_path, seed_int] = test_generate_audio(model_choice=modelchoice,text=test_text_short,speaker_audio=test_asset,seed=PerformanceConfig.DEFAULT_SEED*10)
+        [output_wav_path, seed_int] = test_generate_audio(model_choice=modelchoice,text=test_text_long,speaker_audio=test_asset,seed=PerformanceConfig.DEFAULT_SEED*10)
+        [output_wav_path, seed_int] = test_generate_audio(model_choice=modelchoice,text=test_text_long,speaker_audio=test_asset,seed=PerformanceConfig.DEFAULT_SEED*10)
 
 
     except Exception as e:
