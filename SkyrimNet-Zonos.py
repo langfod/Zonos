@@ -15,7 +15,7 @@ import gradio as gr
 
 # Local imports
 from utilities.app_config import AppConfiguration
-from utilities.app_constants import UIConfig, PerformanceConfig
+from utilities.app_constants import UIConfig, PerformanceConfig, AudioGenerationConfig
 from utilities.audio_generation_pipeline import (
     prepare_generation_params, setup_speaker_conditioning, 
     create_conditioning_dict, setup_prefix_audio,
@@ -91,6 +91,85 @@ def handle_cli_options(args, config):
 def load_model_wrapper(model_choice: str, disable_torch_compile: bool = disable_torch_compile_default):
     """Wrapper for model loading"""
     return load_model_if_needed(model_choice, DEFAULT_DEVICE, config.models.keys(), disable_torch_compile=disable_torch_compile)
+
+
+def run_startup_warmup(model_choice: str, disable_torch_compile: bool) -> None:
+    """Run a short generation pass at startup to trigger compilation and autotune."""
+    warmup_label = "warmup sample"
+    emotions = [0.0] * 8
+    start_ns = perf_counter_ns()
+
+    try:
+        selected_model = load_model_wrapper(model_choice, disable_torch_compile)
+
+        params = prepare_generation_params(
+            text=warmup_label,
+            seed=PerformanceConfig.DEFAULT_SEED,
+            randomize_seed=False,
+            speaker_noised=False,
+            vq_single=UIConfig.VQ_SCORE_RANGE[2],
+            fmax=UIConfig.FMAX_RANGE[2],
+            pitch_std=UIConfig.PITCH_STD_RANGE[2],
+            speaking_rate=UIConfig.SPEAKING_RATE_RANGE[2],
+            dnsmos_ovrl=UIConfig.DNSMOS_RANGE[2],
+            cfg_scale=UIConfig.CFG_SCALE_RANGE[2],
+            top_p=0.0,
+            top_k=0,
+            min_p=0.0,
+            linear=0.5,
+            confidence=0.40,
+            quadratic=0.0,
+            disable_torch_compile=disable_torch_compile
+        )
+
+        params['vq_single'] = UIConfig.VQ_SCORE_RANGE[2]
+        params['disable_torch_compile'] = disable_torch_compile
+
+        cond_dict = create_conditioning_dict(
+            text=warmup_label,
+            language="en-us",
+            speaker_embedding=None,
+            emotions=emotions,
+            params=params,
+            unconditional_keys=[]
+        )
+
+        conditioning = selected_model.prepare_conditioning(
+            cond_dict,
+            cfg_scale=params['cfg_scale'],
+            use_cache=False
+        )
+
+        warmup_tokens = min(AudioGenerationConfig.TOKENS_PER_SECOND, params['max_new_tokens'])
+
+        codes = selected_model.generate(
+            prefix_conditioning=conditioning,
+            audio_prefix_codes=None,
+            max_new_tokens=warmup_tokens,
+            cfg_scale=params['cfg_scale'],
+            batch_size=1,
+            sampling_params={
+                'top_p': params['top_p'],
+                'top_k': params['top_k'],
+                'min_p': params['min_p'],
+                'linear': params['linear'],
+                'conf': params['confidence'],
+                'quad': params['quadratic']
+            },
+            disable_torch_compile=disable_torch_compile,
+            callback=None
+        )
+
+        selected_model.autoencoder.decode(codes)
+
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+
+        duration_s = (perf_counter_ns() - start_ns) / 1_000_000_000
+        logging.info(f"Startup warmup completed in {duration_s:.2f} seconds")
+
+    except Exception as exc:  # noqa: BLE001 - guard warmup failures without blocking launch
+        logging.warning("Warmup failed: %s", exc, exc_info=True)
 
 
 def update_ui(model_choice, disable_torch_compile):
@@ -226,7 +305,9 @@ if __name__ == "__main__":
     
     # Set up Gradio static paths and preload model
     gr.set_static_paths(paths=["assets/"])
-    load_model_wrapper("Zyphra/Zonos-v0.1-transformer")
+    default_model_choice = "Zyphra/Zonos-v0.1-transformer"
+    load_model_wrapper(default_model_choice)
+    run_startup_warmup(default_model_choice, disable_torch_compile_default)
     
     # Build and launch interface
     demo = build_interface().queue()
