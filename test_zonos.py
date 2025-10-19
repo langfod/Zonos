@@ -3,7 +3,7 @@
 Zonos Text-to-Speech Application with Gradio Interface
 """
 import asyncio
-import logging
+from loguru import logger
 import math
 
 from argparse import ArgumentParser
@@ -19,7 +19,6 @@ from pathlib import Path
 from scipy.io.wavfile import write
 import torch
 from loguru import logger
-import warnings
 #from test_utils.audio_graph import plot_audio
 from utilities.cache_utils import save_torchaudio_wav
 # Local imports - utilities  
@@ -74,10 +73,10 @@ LOG_PREFIX = "CROSSOS_LOG"
 # LOGGING AND DEVICE SETUP
 # =============================================================================
 
-logging.basicConfig(
-    level=logging.INFO,
+logger.basicConfig(
+    level=logger.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[logging.StreamHandler(stdout)]
+    handlers=[logger.StreamHandler(stdout)]
 )
 
 # =============================================================================
@@ -371,7 +370,7 @@ async def generate_audio_with_testing_features(model_choice, text, language, spe
         
         # Setup conditioning using utility functions
         speaker_embedding = await setup_speaker_conditioning(
-            speaker_audio, unconditional_keys, uuid, selected_model
+            speaker_audio, unconditional_keys, selected_model
         )
         
         cond_dict = create_conditioning_dict(
@@ -417,7 +416,7 @@ async def generate_audio_with_testing_features(model_choice, text, language, spe
 
                 # Setup conditioning using utility functions with profiling steps
                 speaker_embedding = await setup_speaker_conditioning(
-                    speaker_audio, unconditional_keys, uuid, selected_model
+                    speaker_audio, unconditional_keys, selected_model
                 )
                 prof.step()
                 
@@ -454,8 +453,8 @@ async def generate_audio_with_testing_features(model_choice, text, language, spe
                 )
                 end2 = perf_counter_ns()
                 torch.cuda.nvtx.range_pop()
-        logging.info(f"'generate1' took {(end1 - generate_start_time) /1000000:.4f} ms")
-        logging.info(f"'generate2' took {(end2 - end1) /1000000:.4f} ms")
+        logger.info(f"'generate1' took {(end1 - generate_start_time) /1000000:.4f} ms")
+        logger.info(f"'generate2' took {(end2 - end1) /1000000:.4f} ms")
         summarize_profiler(prof, out_dir="profile_logs", topk=50)
         
         # Track memory after generation  
@@ -481,18 +480,18 @@ async def generate_audio_with_testing_features(model_choice, text, language, spe
                            conf=params['confidence'], quad=params['quadratic'])
                     )
         end = perf_counter_ns()
-        logging.info(f"'generate' took {(end - generate_start_time) /1000000:.4f} ms")
+        logger.info(f"'generate' took {(end - generate_start_time) /1000000:.4f} ms")
 
     # Decode audio and convert to numpy
     wav_np = selected_model.autoencoder.decode(codes)
-    
-    output_wav_path = save_torchaudio_wav(wav_np.squeeze(0), selected_model.autoencoder.sampling_rate, audio_path=speaker_audio,uuid=uuid)
-    
+
+    output_wav_path = save_torchaudio_wav(wav_np.squeeze(0), selected_model.autoencoder.sampling_rate, audio_path=speaker_audio)
+
     # Log performance
     func_end_time = perf_counter_ns()
     total_duration_s = (func_end_time - func_start_time) / 1_000_000_000  # Convert nanoseconds to seconds
     wav_length = wav_np.shape[-1] / selected_model.autoencoder.sampling_rate
-    logging.info(f"Generated audio length: {wav_length:.2f} seconds {selected_model.autoencoder.sampling_rate}. Speed: {wav_length / total_duration_s:.2f}x")
+    logger.info(f"Generated audio length: {wav_length:.2f} seconds {selected_model.autoencoder.sampling_rate}. Speed: {wav_length / total_duration_s:.2f}x")
     stdout.flush()
 
     return [output_wav_path, uuid]

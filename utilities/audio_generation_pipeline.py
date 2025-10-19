@@ -2,7 +2,7 @@
 Audio generation pipeline utilities
 """
 import math
-import logging
+from loguru import logger
 from time import perf_counter_ns
 from typing import Optional, Callable, Dict, Any, Tuple
 
@@ -32,7 +32,7 @@ class PerformanceTimer:
         if self.start_time:
             duration_ms = (perf_counter_ns() - self.start_time) / 1000000
             if duration_ms > self.threshold_ms:
-                logging.info(f"{self.name} took: {duration_ms:.4f} ms")
+                logger.info(f"{self.name} took: {duration_ms:.4f} ms")
 
 
 def prepare_generation_params(text: str, seed: int, randomize_seed: bool, 
@@ -75,8 +75,7 @@ def prepare_generation_params(text: str, seed: int, randomize_seed: bool,
     return params
 
 
-async def setup_speaker_conditioning(speaker_audio: Optional[str], unconditional_keys: list, 
-                                   uuid: int, model, enable_disk_cache: bool = True) -> Optional[Any]:
+async def setup_speaker_conditioning(speaker_audio: Optional[str], unconditional_keys: list, model, enable_disk_cache: bool = True) -> Optional[Any]:
     """Process speaker audio for conditioning"""
     if speaker_audio is None or "speaker" in unconditional_keys:
         return None
@@ -84,8 +83,6 @@ async def setup_speaker_conditioning(speaker_audio: Optional[str], unconditional
     with PerformanceTimer("speaker_embedding"):
         return await process_speaker_audio(
             speaker_audio_path=speaker_audio, 
-            uuid=uuid, 
-            model=model, 
             device=DEFAULT_DEVICE,
             enable_disk_cache=enable_disk_cache
         )
@@ -140,7 +137,7 @@ def create_progress_callback(do_progress: bool, text: str, progress: gr.Progress
 
 def generate_and_save_audio(model, conditioning: torch.Tensor, params: Dict[str, Any], 
                           audio_prefix_codes: Optional[Any], callback: Optional[Callable],
-                          speaker_audio: Optional[str], uuid: int) -> Tuple[str, float]:
+                          speaker_audio: Optional[str]) -> Tuple[str, float]:
     """Execute the main generation and save the result"""
     
     with PerformanceTimer("generate"):
@@ -167,8 +164,8 @@ def generate_and_save_audio(model, conditioning: torch.Tensor, params: Dict[str,
         wav_np.squeeze(0), 
         model.autoencoder.sampling_rate, 
         audio_path=speaker_audio,
-        uuid=uuid
     )
     
     wav_length = wav_np.shape[-1] / model.autoencoder.sampling_rate
     return output_wav_path, wav_length
+

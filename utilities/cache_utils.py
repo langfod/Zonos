@@ -26,16 +26,14 @@ Example usage:
     stats = get_cache_stats()
 
 """
-
 import datetime
 import functools
-import logging
+from loguru import logger
 import os
 import threading
 import traceback
 from pathlib import Path
 from typing import Dict, Optional, Union
-import warnings
 
 import psutil
 import torch
@@ -90,7 +88,7 @@ class TensorCacheManager:
         with self._lock:
             # Check memory cache first
             if cache_key in self._memory_cache:
-                logging.debug(f"Cache hit (memory): {cache_key}")
+                logger.debug(f"Cache hit (memory): {cache_key}")
                 return self._memory_cache[cache_key]
             
             # Try loading from disk if enabled
@@ -99,10 +97,10 @@ class TensorCacheManager:
                 if tensor is not None:
                     # Store in memory cache for faster future access
                     self._memory_cache[cache_key] = tensor
-                    logging.debug(f"Cache hit (disk->memory): {cache_key}")
+                    logger.debug(f"Cache hit (disk->memory): {cache_key}")
                     return tensor
             
-            logging.debug(f"Cache miss: {cache_key}")
+            logger.debug(f"Cache miss: {cache_key}")
             return None
     
     def set(self, cache_key: str, tensor: torch.Tensor, save_to_disk_flag: bool = True) -> None:
@@ -117,7 +115,7 @@ class TensorCacheManager:
         with self._lock:
             # Store in memory cache
             self._memory_cache[cache_key] = tensor
-            logging.debug(f"Cached to memory: {cache_key}")
+            logger.debug(f"Cached to memory: {cache_key}")
             
             # Optionally save to disk
             if save_to_disk_flag:
@@ -151,7 +149,7 @@ class TensorCacheManager:
         """Clear all entries from memory cache."""
         with self._lock:
             self._memory_cache.clear()
-            logging.info(f"Cleared {self.cache_type} memory cache")
+            logger.info(f"Cleared {self.cache_type} memory cache")
     
     def clear_disk(self) -> None:
         """Clear all entries from disk cache."""
@@ -160,9 +158,9 @@ class TensorCacheManager:
         try:
             for cache_file in cache_dir.glob("*.pt"):
                 cache_file.unlink()
-            logging.info(f"Cleared {self.cache_type} disk cache")
+            logger.info(f"Cleared {self.cache_type} disk cache")
         except Exception as e:
-            logging.error(f"Failed to clear {self.cache_type} disk cache: {e}")
+            logger.error(f"Failed to clear {self.cache_type} disk cache: {e}")
     
     def clear_all(self) -> None:
         """Clear both memory and disk caches."""
@@ -197,7 +195,7 @@ class TensorCacheManager:
             if cache_key in self._memory_cache:
                 del self._memory_cache[cache_key]
                 removed = True
-                logging.debug(f"Removed from memory cache: {cache_key}")
+                logger.debug(f"Removed from memory cache: {cache_key}")
         
         # Remove from disk
         if remove_from_disk:
@@ -207,9 +205,9 @@ class TensorCacheManager:
                 try:
                     cache_file.unlink()
                     removed = True
-                    logging.debug(f"Removed from disk cache: {cache_key}")
+                    logger.debug(f"Removed from disk cache: {cache_key}")
                 except Exception as e:
-                    logging.error(f"Failed to remove {cache_key} from disk: {e}")
+                    logger.error(f"Failed to remove {cache_key} from disk: {e}")
         
         return removed
 
@@ -318,10 +316,10 @@ def save_to_disk(cache_key:str, cache_type:str, speaker_embedding: torch.Tensor)
 
         torch.save(speaker_embedding, cache_file)
 
-        logging.info(f"Saved {cache_type} cache to disk: {cache_key} as {cache_file}")
+        logger.info(f"Saved {cache_type} cache to disk: {cache_key} as {cache_file}")
 
     except Exception as e:
-        logging.error(f"Failed to save {cache_type} from disk cache: {e}")
+        logger.error(f"Failed to save {cache_type} from disk cache: {e}")
         print(f"Failed to save {cache_type} from disk cache: {e}")
         print(traceback.format_exc())
 
@@ -336,39 +334,26 @@ def load_from_disk(cache_key, cache_type, device: torch.device):
         cache_file = cache_dir.joinpath(cache_key + ".pt")
 
         if not cache_file.exists():
-            logging.warning(f"Cache file {cache_file} does not exist.")
+            logger.warning(f"Cache file {cache_file} does not exist.")
             return None
 
         return torch.load(cache_file, map_location=device, weights_only=True)
 
     except Exception as e:
         import traceback
-        logging.error(f"Failed to load {cache_type} disk cache: {e}")
+        logger.error(f"Failed to load {cache_type} disk cache: {e}")
         print(f"Failed to load {cache_type} disk cache: {e}")
         print(traceback.format_exc())
         return None
 
 @functools.cache
-def get_cache_key(audio_path, uuid: int = None):
-    """Generate a cache key based on audio file, UUID, and exaggeration"""
+def get_cache_key(audio_path):
+    """Generate a cache key based on audio file"""
     if audio_path is None:
         return None
 
-    cache_prefix = Path(audio_path).stem
+    return Path(audio_path).stem
 
-    if uuid is not None:
-        # Ensure the cache prefix is a valid string
-        # Convert UUID to hex string for readability
-        try:
-            uuid_hex = hex(uuid)[2:]  # Remove '0x' prefix
-        except (TypeError, ValueError):
-            uuid_hex = str(uuid)
-
-        cache_key = f"{cache_prefix}_{uuid_hex}"
-    else:
-        cache_key = cache_prefix
-
-    return cache_key
 
 @functools.cache
 def get_wavout_dir():
@@ -377,16 +362,14 @@ def get_wavout_dir():
     wavout_dir.mkdir(parents=True, exist_ok=True)
     return wavout_dir
 
-def save_torchaudio_wav(wav_tensor, sr, audio_path, uuid):
+def save_torchaudio_wav(wav_tensor, sr, audio_path):
     """Save a tensor as a WAV file using torchaudio"""
 
     formatted_now_time = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
 
-    filename = f"{formatted_now_time}_{get_cache_key(audio_path, uuid)}"
+    filename = f"{formatted_now_time}_{get_cache_key(audio_path)}"
     path = get_wavout_dir() / f"{filename}.wav"
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        torchaudio.save(path, wav_tensor.cpu(), sr, encoding="PCM_S")
+    torchaudio.save(path, wav_tensor.cpu(), sr, encoding="PCM_S")
     return path.resolve()
 
 
@@ -467,3 +450,11 @@ def is_cached(cache_key: str, cache_type: str = "embeds", device: Optional[torch
         raise ValueError(f"Unknown cache type: {cache_type}")
     
     return manager.exists(cache_key)
+
+@functools.cache
+def get_speakers_dir(language: str = "en") -> Path:
+    """Get or create the speakers directory"""
+    speakers_dir = Path("speakers").joinpath(language)
+    speakers_dir.mkdir(parents=True, exist_ok=True)
+    return speakers_dir
+

@@ -15,7 +15,6 @@ wheels/
 /.idea
 /models
 /.continue
-/cache
 /output_temp
 /.vscode
 /profile_logs
