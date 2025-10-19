@@ -6,12 +6,16 @@ Zonos Text-to-Speech Application with Gradio Interface
 # Standard library imports
 import logging
 from argparse import ArgumentParser
+from pathlib import Path
 from sys import exit, stdout
 from time import perf_counter_ns
 
 # Third-party imports
 import torch
 import gradio as gr
+from gradio import processing_utils as gr_processing_utils
+from gradio.data_classes import GradioModel, GradioRootModel
+from gradio_client import utils as gr_client_utils
 
 # Local imports
 from utilities.app_config import AppConfiguration
@@ -34,6 +38,105 @@ from utilities.ui_components import (
 # Zonos-specific imports
 from zonos.model import DEFAULT_BACKBONE_CLS as ZONOS_BACKBONE
 from zonos.utilities.utils import DEFAULT_DEVICE
+
+
+# =============================================================================
+# GRADIO PATH HANDLING PATCH
+# =============================================================================
+
+def _path_is_relative_to(path: Path, base: Path) -> bool:
+    """Compatibility helper for checking whether path is inside base."""
+    try:
+        path.relative_to(base)
+        return True
+    except ValueError:
+        return False
+
+
+def _install_gradio_path_patch():
+    """Allow trusted local files to be accepted by Gradio preprocessing."""
+
+    trusted_roots = [
+        Path.cwd(),
+        Path.cwd() / "assets",
+        Path.cwd() / "cache",
+        Path.cwd() / "output_temp",
+    ]
+
+    original_check_allowed = getattr(gr_processing_utils, "_check_allowed", None)
+
+    if original_check_allowed is None:
+        logging.warning("Could not locate gradio.processing_utils._check_allowed")
+        return
+
+    def patched_check_allowed(path, check_in_upload_folder):
+        logging.info(
+            "Gradio path check: %s (check_in_upload_folder=%s)",
+            path,
+            check_in_upload_folder,
+        )
+        if check_in_upload_folder:
+            try:
+                abs_path = Path(path).resolve()
+            except Exception:  # noqa: BLE001 - fall back to original handler
+                return original_check_allowed(path, check_in_upload_folder)
+
+            if abs_path.is_file() and any(
+                _path_is_relative_to(abs_path, root) for root in trusted_roots
+            ):
+                return
+
+        return original_check_allowed(path, check_in_upload_folder)
+
+    gr_processing_utils._check_allowed = patched_check_allowed
+
+    original_async_move_files_to_cache = gr_processing_utils.async_move_files_to_cache
+
+    async def patched_async_move_files_to_cache(
+        data,
+        block,
+        postprocess: bool = False,
+        check_in_upload_folder: bool = False,
+        keep_in_cache: bool = False,
+    ):
+        if isinstance(data, (GradioRootModel, GradioModel)):
+            data = data.model_dump()
+
+        def _scrub_payload(d):
+            if gr_client_utils.is_file_obj_with_meta(d):
+                path = d.get("path")
+                if not path:
+                    logging.info("Dropping empty file payload for block %s", getattr(block, "label", block.__class__.__name__))
+                    return None
+                try:
+                    resolved_path = Path(path).resolve()
+                except Exception:  # noqa: BLE001 - leave payload unchanged if path invalid
+                    return d
+
+                if resolved_path.is_dir():
+                    logging.info("Dropping directory payload for block %s: %s", getattr(block, "label", block.__class__.__name__), resolved_path)
+                    return None
+
+            return d
+
+        cleaned_data = gr_client_utils.traverse(
+            data,
+            _scrub_payload,
+            gr_client_utils.is_file_obj_with_meta,
+        )
+
+        return await original_async_move_files_to_cache(
+            cleaned_data,
+            block,
+            postprocess=postprocess,
+            check_in_upload_folder=check_in_upload_folder,
+            keep_in_cache=keep_in_cache,
+        )
+
+    gr_processing_utils.async_move_files_to_cache = patched_async_move_files_to_cache
+
+
+_install_gradio_path_patch()
 
 # =============================================================================
 # APPLICATION SETUP
