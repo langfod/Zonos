@@ -148,13 +148,7 @@ def init_latent_cache() -> None:
                 if loop and loop.is_running():
                     asyncio.create_task(coro)
                 else:
-                    asyncio.run(coro)
-        #try:
-        #    if '.wav' in files:
-        #        # .wav files - compute latents from audio
-        #        speaker_wav_path = files['.wav']
-        #        logger.info(f"Processing .wav file: {speaker_wav_path}")
-        #        speaker_embedding = asyncio.run(process_speaker_audio(str(speaker_wav_path), enable_disk_cache=True))                                       
+                    asyncio.run(coro)                                
         except Exception as e:
             import traceback
             traceback.print_exc()
