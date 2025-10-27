@@ -134,13 +134,27 @@ def init_latent_cache() -> None:
     
     # Process each speaker, preferring .wav over .json
     for base_name, files in speaker_files.items():
-       
         try:
             if '.wav' in files:
                 # .wav files - compute latents from audio
                 speaker_wav_path = files['.wav']
                 logger.info(f"Processing .wav file: {speaker_wav_path}")
-                speaker_embedding = asyncio.run(process_speaker_audio(str(speaker_wav_path), enable_disk_cache=True))                                       
+                coro = process_speaker_audio(str(speaker_wav_path), enable_disk_cache=True)
+                # If an event loop is running, schedule task; otherwise run synchronously
+                try:
+                    loop = asyncio.get_running_loop()
+                except RuntimeError:
+                    loop = None
+                if loop and loop.is_running():
+                    asyncio.create_task(coro)
+                else:
+                    asyncio.run(coro)
+        #try:
+        #    if '.wav' in files:
+        #        # .wav files - compute latents from audio
+        #        speaker_wav_path = files['.wav']
+        #        logger.info(f"Processing .wav file: {speaker_wav_path}")
+        #        speaker_embedding = asyncio.run(process_speaker_audio(str(speaker_wav_path), enable_disk_cache=True))                                       
         except Exception as e:
             import traceback
             traceback.print_exc()
