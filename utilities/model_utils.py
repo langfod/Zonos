@@ -1,9 +1,10 @@
 """
 Model loading and management utilities for Zonos application.
 """
+
 import os
 import torch
-import logging
+from loguru import logger
 from typing import Optional
 from zonos.model import Zonos
 from utilities.config_utils import is_online_model
@@ -19,12 +20,12 @@ def load_model_if_needed(model_choice: str,
     global CURRENT_MODEL_TYPE, CURRENT_MODEL
 
     if CURRENT_MODEL_TYPE != model_choice:
-        logging.info(f"Model type changed from {CURRENT_MODEL_TYPE} to {model_choice}. Reloading model...")
+        logger.info(f"Model type changed from {CURRENT_MODEL_TYPE} to {model_choice}. Reloading model...")
         if CURRENT_MODEL is not None:
             del CURRENT_MODEL
             torch.cuda.empty_cache()
 
-        logging.info(f"Loading {model_choice} model...")
+        logger.info(f"Loading {model_choice} model...")
 
         if is_online_model(model_choice, needed_models, debug_mode=False):
             model = Zonos.from_pretrained(model_choice, device=device.type)
@@ -55,18 +56,26 @@ def load_model_if_needed(model_choice: str,
                     model.autoencoder.decode = torch.compile(
                         model.autoencoder.decode, 
                         fullgraph=True, 
-                        mode="default"
+                        mode="default",
+                        options={
+                            "triton.cudagraphs": False,  # Disable CUDA graphs for this method
+                            "max_autotune": False,        # Disable max-autotune optimizations
+                            "epilogue_fusion": True,     # Enable operation fusion
+                            "max_autotune_pointwise": True  # Aggressive pointwise optimizations
+                        }
                     )
                 if reset_compiler:
                     torch.compiler.reset()
             except Exception as e:
-                logging.info(f"Warning: Could not compile the autoencoder decoder. It will run unoptimized. Error: {e}")
+                logger.info(f"Warning: Could not compile the autoencoder decoder. It will run unoptimized. Error: {e}")
 
-            logging.info(f"{model_choice} model loaded successfully!")
+            logger.info(f"{model_choice} model loaded successfully!")
 
         CURRENT_MODEL = model
         CURRENT_MODEL_TYPE = model_choice
-
+    
+        from utilities.audio_utils import init_latent_cache
+        init_latent_cache() 
     return CURRENT_MODEL
 
 
@@ -87,3 +96,4 @@ def get_supported_models(backbone_cls, ai_model_dir_hy: str, ai_model_dir_tf: st
         supported_models.append(ai_model_dir_tf)
 
     return supported_models
+

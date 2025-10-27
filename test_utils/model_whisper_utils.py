@@ -6,7 +6,7 @@ from typing import Optional, Tuple
 import numpy as np
 import torch
 from faster_whisper import WhisperModel
-import logging
+from loguru import logger
 
 from .torch_utils import (audio_tensor_to_numpy, load_audio_to_np, resample_audio_tensor)
 
@@ -24,11 +24,11 @@ def initialize_whisper_model():
     
     if WHISPER_ENGINE is None:
             # Initialize Whisper model
-            #logging.info("Loading Whisper model...")
+            #logger.info("Loading Whisper model...")
             WHISPER_ENGINE = WhisperModel(WHISPER_MODEL, device="cuda", compute_type="float32")
             #WHISPER_ENGINE = WhisperModel(WHISPER_MODEL, device="cpu", compute_type="int8")
             #WHISPER_ENGINE = WhisperModel(WHISPER_MODEL, device=DEVICE, compute_type="int8" if DEVICE=="cuda" else "int8")
-            #logging.info("Whisper model loaded successfully.")
+            #logger.info("Whisper model loaded successfully.")
     return WHISPER_ENGINE
 
 
@@ -71,5 +71,5 @@ def transcribe_audio_with_whisper(ref_audio_torch: torch.Tensor, sr: int) -> str
 
     except Exception as e:
         print(traceback.format_exc())
-        logging.error(f"Failed to transcribe audio: {str(e)}")
+        logger.error(f"Failed to transcribe audio: {str(e)}")
         return ""

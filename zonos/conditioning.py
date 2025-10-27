@@ -7,7 +7,9 @@ import torch.nn as nn
 
 from zonos.config import PrefixConditionerConfig
 from zonos.utilities.utils import DEFAULT_DEVICE
+import logging
 
+from phonemizer.backend import EspeakBackend
 
 class Conditioner(nn.Module):
     """
@@ -288,9 +290,7 @@ def clean(texts: list[str], languages: list[str]) -> list[str]:
 
 @cache
 def get_backend(language: str) -> "EspeakBackend":
-    import logging
 
-    from phonemizer.backend import EspeakBackend
 
     logger = logging.getLogger("phonemizer")
     backend = EspeakBackend(

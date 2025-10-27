@@ -1,6 +1,6 @@
 
 import datetime
-import logging
+from loguru import logger
 import matplotlib.pyplot as plt
 from matplotlib.ticker import MultipleLocator
 import numpy as np
@@ -8,10 +8,10 @@ import time
 from utilities.audio_utils import get_cache_key
 from utilities.cache_utils import get_wavout_dir
 
-def plot_audio(wav_np, sr, words=None, audio_path=None, uuid=None):
+def plot_audio(wav_np, sr, words=None, audio_path=None):
 
     formatted_now_time = datetime.datetime.fromtimestamp(time.time()).strftime("%Y%m%d_%H%M%S")
-    label = f"{formatted_now_time}_{get_cache_key(audio_path, uuid)}"
+    label = f"{formatted_now_time}_{get_cache_key(audio_path)}"
     # Create time axis
     t = np.linspace(0, len(wav_np) / sr, num=len(wav_np))
     wav_np = wav_np.squeeze(0).cpu().numpy()
@@ -34,5 +34,5 @@ def plot_audio(wav_np, sr, words=None, audio_path=None, uuid=None):
     path = get_wavout_dir().joinpath(f"{label}.png")
 
     fig.savefig(path,dpi=300)
-    logging.info(f"Saved audio plot to {path}")
+    logger.info(f"Saved audio plot to {path}")
     #plt.show()

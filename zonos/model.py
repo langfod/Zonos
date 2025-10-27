@@ -1,5 +1,5 @@
 import json
-import logging
+from loguru import logger
 from typing import Callable
 
 import safetensors
@@ -526,7 +526,7 @@ class Zonos(nn.Module):
             
             if eos_boundary is not None:
                 valid_length = eos_boundary
-                logging.debug(f"Found EOS boundary at position {eos_boundary}, truncating sequence")
+                logger.debug(f"Found EOS boundary at position {eos_boundary}, truncating sequence")
 
         invalid_mask = out_codes > 1024
         eos_mask = out_codes == 1024
@@ -539,10 +539,10 @@ class Zonos(nn.Module):
         final_codes = torch.clamp(final_codes, 0, 1023)
 
         actual_new_tokens = offset - (prefix_audio_len + 1)
-        logging.debug(f"Max Token: {max_new_tokens}. Actual decoded tokens (excluding prompt): {actual_new_tokens}")
-        logging.debug(f"Final offset: {offset}, prefix_audio_len: {prefix_audio_len}")
-        logging.debug(f"out_codes shape before slicing: {out_codes.shape}")
-        logging.debug(f"final_codes shape: {final_codes.shape}")
+        logger.debug(f"Max Token: {max_new_tokens}. Actual decoded tokens (excluding prompt): {actual_new_tokens}")
+        logger.debug(f"Final offset: {offset}, prefix_audio_len: {prefix_audio_len}")
+        logger.debug(f"out_codes shape before slicing: {out_codes.shape}")
+        logger.debug(f"final_codes shape: {final_codes.shape}")
 
         self._cg_graph = None
         return final_codes

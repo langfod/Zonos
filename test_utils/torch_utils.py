@@ -1,11 +1,7 @@
 
 import numpy as np
 from typing import Optional, Tuple, Any
-import warnings
 import torchaudio
-
-# Suppress the specific UserWarning related to torchaudio.load
-warnings.filterwarnings("ignore", message="In 2.9, this function's implementation will be changed to use torchaudio.load_with_torchcodec`")
 
 # Optional dependencies
 try:

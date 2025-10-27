@@ -13,6 +13,14 @@ The module attempts to import mamba-ssm first, falling back to pure PyTorch impl
 if the mamba-ssm package is not installed.
 """
 
+import traceback
+import os
+if os.name == 'nt' and os.environ.get('CUDA_PATH'):
+    dll_path = os.path.join(os.environ['CUDA_PATH'], 'bin')
+    print(dll_path)
+    if os.path.isdir(dll_path):
+        os.add_dll_directory(dll_path)
+
 BACKBONES = {}
 
 try:
@@ -22,7 +30,7 @@ try:
     BACKBONES["torch"] = MambaSSMZonosBackbone
 
 except ImportError:
-
+    print(traceback.format_exc())
     from ._torch import TorchZonosBackbone
     
     BACKBONES["torch"] = TorchZonosBackbone
