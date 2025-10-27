@@ -105,9 +105,8 @@ def init_latent_cache() -> None:
     cache_manager = get_embed_cache_manager()
     cache_manager.clear_memory()
 
-    cached_latents = {}
     latent_dir = get_embed_cache_dir()
-    print(f"Loading latents from {latent_dir}")
+    
     # Load existing .pt files from latents directory
     for filename in latent_dir.glob("*.pt"):
         try:
@@ -116,7 +115,7 @@ def init_latent_cache() -> None:
             logger.error(f"Failed to load latents from {filename}: {e}")
     
     speaker_dir = get_speakers_dir()
-    print(f"Loading speakers from {speaker_dir}")
+
     # Get all speaker files and organize by base name
     speaker_files = {}
     for file_path in speaker_dir.iterdir():

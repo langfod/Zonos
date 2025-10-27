@@ -2,7 +2,7 @@
 --extra-index-url=https://download.pytorch.org/whl/cu129 ; sys_platform  != 'darwin'
 torch<2.9
 torchaudio
-#torchcodec
+
 #TRITON*************************************
 triton-windows<3.5; sys_platform == 'win32' # tw
 triton; sys_platform != 'win32' and sys_platform != 'darwin'  # linux

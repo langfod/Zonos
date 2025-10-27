@@ -59,7 +59,7 @@ def load_model_if_needed(model_choice: str,
                         mode="default",
                         options={
                             "triton.cudagraphs": False,  # Disable CUDA graphs for this method
-                            "max_autotune": False,        # Enable max-autotune optimizations
+                            "max_autotune": False,        # Disable max-autotune optimizations
                             "epilogue_fusion": True,     # Enable operation fusion
                             "max_autotune_pointwise": True  # Aggressive pointwise optimizations
                         }

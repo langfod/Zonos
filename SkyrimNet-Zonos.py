@@ -114,7 +114,7 @@ async def generate_audio(model_choice, text, language, speaker_audio, prefix_aud
         IGNORE_PING = "pending"
        else:
           logger.info("Ping request received, sending silence audio.")
-          return "assets/silence_100ms.wav", seed
+          return ["assets/silence_100ms.wav", seed]
 
     emotions = [e1, e2, e3, e4, e5, e6, e7, e8]
 
