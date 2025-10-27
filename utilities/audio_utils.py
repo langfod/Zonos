@@ -2,20 +2,19 @@
 Audio processing utilities for Zonos application.
 """
 import asyncio
-from typing import List
 import torch
 import torchaudio
 from loguru import logger
 from utilities.cache_utils import (
     get_cache_key,
-    get_embed_cache_dir,
     get_embed_cache_manager, 
     get_prefix_cache_manager,
-    get_speakers_dir,
+    get_embed_cache_dir,
+    get_speakers_dir
 )
 from zonos.speaker_cloning import SpeakerEmbeddingLDA
 spk_clone_model = None
-spk_clone_model_device = "cuda" #"cpu"
+spk_clone_model_device = "cuda" if torch.cuda.is_available() else "cpu"
 
 def make_speaker_embedding(wav: torch.Tensor, sr: int) -> torch.Tensor:
     global spk_clone_model
@@ -26,11 +25,14 @@ def make_speaker_embedding(wav: torch.Tensor, sr: int) -> torch.Tensor:
     _, spk_embedding = spk_clone_model(wav, sr)
     return spk_embedding.unsqueeze(0).bfloat16()
 
-async def process_speaker_audio(speaker_audio_path: str, device: torch.device, enable_disk_cache=True) -> torch.Tensor:
+async def process_speaker_audio(speaker_audio_path: str, device: torch.device = torch.device(spk_clone_model_device), enable_disk_cache=True) -> torch.Tensor:
     """
     Process speaker audio and return speaker embedding.
     Uses caching to avoid recomputing embeddings for the same audio.
     """
+    if device is None:
+        device = torch.device(spk_clone_model_device)
+
     cache_key = get_cache_key(speaker_audio_path)
     speaker_cache = get_embed_cache_manager(device)
     
@@ -98,10 +100,14 @@ async def process_prefix_audio(prefix_audio_path: str, model, device: torch.devi
 
 def init_latent_cache() -> None:
     """Initialize latent cache from disk for all supported languages."""
+    get_embed_cache_dir.cache_clear()
+
     cache_manager = get_embed_cache_manager()
+    cache_manager.clear_memory()
+
     cached_latents = {}
     latent_dir = get_embed_cache_dir()
-        
+    print(f"Loading latents from {latent_dir}")
     # Load existing .pt files from latents directory
     for filename in latent_dir.glob("*.pt"):
         try:
@@ -110,7 +116,7 @@ def init_latent_cache() -> None:
             logger.error(f"Failed to load latents from {filename}: {e}")
     
     speaker_dir = get_speakers_dir()
-    
+    print(f"Loading speakers from {speaker_dir}")
     # Get all speaker files and organize by base name
     speaker_files = {}
     for file_path in speaker_dir.iterdir():
@@ -125,10 +131,10 @@ def init_latent_cache() -> None:
        
         try:
             if '.wav' in files:
-                # Prefer .wav files - compute latents from audio
+                # .wav files - compute latents from audio
                 speaker_wav_path = files['.wav']
                 logger.info(f"Processing .wav file: {speaker_wav_path}")
-                speaker_embedding = asyncio.run(process_speaker_audio(str(speaker_wav_path), device=torch.device("cpu"), enable_disk_cache=True))                                       
+                speaker_embedding = asyncio.run(process_speaker_audio(str(speaker_wav_path), enable_disk_cache=True))                                       
         except Exception as e:
             import traceback
             traceback.print_exc()

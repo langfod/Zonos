@@ -38,6 +38,8 @@ from typing import Dict, Optional, Union
 import psutil
 import torch
 import torchaudio
+import warnings
+
 
 _cache_lock = threading.Lock()
 # Global cache for audio prefixes
@@ -293,16 +295,29 @@ def get_process_creation_time():
 @functools.cache
 def get_embed_cache_dir():
     """Get or create the conditionals cache directory"""
-    cache_dir = Path("cache/embeds")
+    # Lazy import to avoid circular dependency
+    from utilities.model_utils import CURRENT_MODEL_TYPE
+    
+    model_ext = CURRENT_MODEL_TYPE.split('/')[-1] if CURRENT_MODEL_TYPE else None
+    cache_dir = Path("cache").joinpath("embeds")
+    if model_ext:
+        cache_dir = cache_dir.joinpath(model_ext)
     cache_dir.mkdir(parents=True, exist_ok=True)
     return cache_dir
+
 
 @functools.cache
 def get_prefix_cache_dir():
     """Get or create the conditionals cache directory"""
-    cache_dir = Path("cache/prefixes")
+    # Lazy import to avoid circular dependency
+    #from utilities.model_utils import CURRENT_MODEL_TYPE    
+    #model_ext = CURRENT_MODEL_TYPE.split('/')[-1] if CURRENT_MODEL_TYPE else None
+    cache_dir = Path("cache").joinpath("prefixes")
+    #if model_ext:
+    #    cache_dir = cache_dir.joinpath(model_ext)
     cache_dir.mkdir(parents=True, exist_ok=True)
     return cache_dir
+
 
 def save_to_disk(cache_key:str, cache_type:str, speaker_embedding: torch.Tensor):
     try:
@@ -369,7 +384,9 @@ def save_torchaudio_wav(wav_tensor, sr, audio_path):
 
     filename = f"{formatted_now_time}_{get_cache_key(audio_path)}"
     path = get_wavout_dir() / f"{filename}.wav"
-    torchaudio.save(path, wav_tensor.cpu(), sr, encoding="PCM_S")
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        torchaudio.save(path, wav_tensor.cpu(), sr, encoding="PCM_S")
     return path.resolve()
 
 

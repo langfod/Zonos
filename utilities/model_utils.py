@@ -56,7 +56,13 @@ def load_model_if_needed(model_choice: str,
                     model.autoencoder.decode = torch.compile(
                         model.autoencoder.decode, 
                         fullgraph=True, 
-                        mode="default"
+                        mode="default",
+                        options={
+                            "triton.cudagraphs": False,  # Disable CUDA graphs for this method
+                            "max_autotune": False,        # Enable max-autotune optimizations
+                            "epilogue_fusion": True,     # Enable operation fusion
+                            "max_autotune_pointwise": True  # Aggressive pointwise optimizations
+                        }
                     )
                 if reset_compiler:
                     torch.compiler.reset()
@@ -67,7 +73,9 @@ def load_model_if_needed(model_choice: str,
 
         CURRENT_MODEL = model
         CURRENT_MODEL_TYPE = model_choice
-
+    
+        from utilities.audio_utils import init_latent_cache
+        init_latent_cache() 
     return CURRENT_MODEL
 
 

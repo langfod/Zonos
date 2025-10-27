@@ -21,3 +21,5 @@ wheels/
 assets/dlc1seranavoice.wav
 memory.json
 CONDITIONING_README.md
+/cache
+/temp_dir

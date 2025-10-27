@@ -4,9 +4,9 @@ Zonos Text-to-Speech Application with Gradio Interface
 """
 
 # Standard library imports
-import asyncio
 from argparse import ArgumentParser
 import os
+from pathlib import Path
 from sys import exit, stdout
 from time import perf_counter_ns
 
@@ -22,7 +22,7 @@ from utilities.audio_generation_pipeline import (
     create_conditioning_dict, setup_prefix_audio,
     create_progress_callback, generate_and_save_audio
 )
-from utilities.cache_utils import get_embed_cache_dir, get_wavout_dir
+from utilities.cache_utils import get_embed_cache_dir, get_wavout_dir, get_speakers_dir
 from utilities.file_utils import lcx_checkmodels
 from utilities.gradio_utils import update_ui_visibility  
 from utilities.model_utils import load_model_if_needed, get_supported_models
@@ -32,7 +32,6 @@ from utilities.ui_components import (
     create_conditioning_controls, create_generation_controls,
     create_sampling_controls, create_advanced_controls, create_output_controls
 )
-from utilities.audio_utils import get_speakers_dir, init_latent_cache
 # Zonos-specific imports
 from zonos.model import DEFAULT_BACKBONE_CLS as ZONOS_BACKBONE
 from zonos.utilities.utils import DEFAULT_DEVICE
@@ -49,8 +48,8 @@ config.setup_logging()
 models_dict, models_values = config.load_configuration()
 AI_MODEL_DIR_TF, AI_MODEL_DIR_HY = config.get_model_paths()
 disable_torch_compile_default = config.get_disable_torch_compile_default()
-IGNORE_PING = True
-get_embed_cache_dir
+IGNORE_PING = None
+
 # Enable TF32 for better performance on Ampere+ GPUs
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.benchmark = True  
@@ -108,14 +107,23 @@ async def generate_audio(model_choice, text, language, speaker_audio, prefix_aud
                   top_k, min_p, linear, confidence, quadratic, seed, randomize_seed, unconditional_keys,
                   disable_torch_compile=disable_torch_compile_default, progress=gr.Progress(), do_progress=False):
     """Generate audio based on the provided UI parameters"""
-    logger.info(f'Requested: "{text}"')
+    global IGNORE_PING
 
-    if text == "ping" and IGNORE_PING:
-        logger.info("Ping request received, sending silence audio.")
-        return "assets/silence_100ms.wav", seed
+    if text == "ping":
+       if IGNORE_PING is None:
+        IGNORE_PING = "pending"
+       else:
+          logger.info("Ping request received, sending silence audio.")
+          return "assets/silence_100ms.wav", seed
+
+    emotions = [e1, e2, e3, e4, e5, e6, e7, e8]
 
     if speaker_audio is None:
         speaker_audio = 'malecommoner'
+        logger.info(f'Requested: default {speaker_audio} with{f"out emotion." if "emotion" in unconditional_keys else f" emotion values: {emotions}"} Text: "{text}"')
+    else:
+        logger.info(f'Requested: {Path(speaker_audio).stem} with{f"out emotion." if "emotion" in unconditional_keys else f" emotion values: {emotions}"} Text: "{text}"')
+
 
     func_start_time = perf_counter_ns()
     
@@ -123,7 +131,7 @@ async def generate_audio(model_choice, text, language, speaker_audio, prefix_aud
     selected_model = load_model_wrapper(model_choice, disable_torch_compile)
     
     # Prepare generation parameters
-    emotions = [e1, e2, e3, e4, e5, e6, e7, e8]
+    
     params = prepare_generation_params(
         text=text, seed=seed, randomize_seed=randomize_seed,
         speaker_noised=speaker_noised, vq_single=vq_single,
@@ -162,10 +170,13 @@ async def generate_audio(model_choice, text, language, speaker_audio, prefix_aud
     
     # Log performance
     total_duration_s = (perf_counter_ns() - func_start_time) / 1_000_000_000
-    logger.info(f"Total 'generate_audio' execution time: {total_duration_s:.2f} seconds")
-    logger.info(f"Generated audio length: {wav_length:.2f} seconds. Speed: {wav_length / total_duration_s:.2f}x")
+    logger.info(f"Generated audio length: {wav_length:.2f}s. Execution time: {total_duration_s:.2f}s.Speed: {wav_length / total_duration_s:.2f}x")
     stdout.flush()
 
+    if IGNORE_PING == "pending":
+        IGNORE_PING = True
+        os.remove(output_wav_path)
+        return ["assets/silence_100ms.wav", uuid]
     return [output_wav_path, uuid]
 
 def build_interface():
@@ -242,9 +253,11 @@ if __name__ == "__main__":
     gr.set_static_paths(paths=["assets/"])
     default_model = "Zyphra/Zonos-v0.1-transformer"
     model = load_model_wrapper(default_model)
-    init_latent_cache()
-    warmup_file, _ = asyncio.run(generate_audio(model_choice='Zyphra/Zonos-v0.1-transformer', text='Warmup Time.', language='en-us', speaker_audio=None, prefix_audio="empty_100ms.wav", e1=0.0, e2=0.0, e3=0.0, e4=0.0, e5=0.0, e6=0.0, e7=0.0, e8=1.0, vq_single=0.699999988079071, fmax=24000, pitch_std=45.0, speaking_rate=14.600000381469727, dnsmos_ovrl=4, speaker_noised=False, cfg_scale=4.5, top_p=0.0, top_k=0.0, min_p=0.0, linear=0.5, confidence=0.4000000059604645, quadratic=0.0, seed=6298667263556447910, randomize_seed=False, unconditional_keys=['emotion']))
-    os.remove(warmup_file)
+
+    
+    #warmup_file, _ = asyncio.run(generate_audio(model_choice='Zyphra/Zonos-v0.1-transformer', text='Warmup Time.', language='en-us', speaker_audio=None, prefix_audio="empty_100ms.wav", e1=0.0, e2=0.0, e3=0.0, e4=0.0, e5=0.0, e6=0.0, e7=0.0, e8=1.0, vq_single=0.699999988079071, fmax=24000, pitch_std=45.0, speaking_rate=14.600000381469727, dnsmos_ovrl=4, speaker_noised=False, cfg_scale=4.5, top_p=0.0, top_k=0.0, min_p=0.0, linear=0.5, confidence=0.4000000059604645, quadratic=0.0, seed=6298667263556447910, randomize_seed=False, unconditional_keys=['emotion']))
+    #os.remove(warmup_file)
+
     # Build and launch interface
     demo = build_interface().queue()
     demo.launch(
