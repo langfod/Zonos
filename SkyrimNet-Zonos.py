@@ -41,6 +41,7 @@ from zonos.utilities.utils import DEFAULT_DEVICE
 # =============================================================================
 
 # Initialize configuration
+current_dir = Path(__file__).parent
 config = AppConfiguration()
 config.setup_logging()
 
@@ -108,13 +109,14 @@ async def generate_audio(model_choice, text, language, speaker_audio, prefix_aud
                   disable_torch_compile=disable_torch_compile_default, progress=gr.Progress(), do_progress=False):
     """Generate audio based on the provided UI parameters"""
     global IGNORE_PING
+    job_id = seed
 
     if text == "ping":
        if IGNORE_PING is None:
         IGNORE_PING = "pending"
        else:
           logger.info("Ping request received, sending silence audio.")
-          return ["assets/silence_100ms.wav", seed]
+          return ["assets/silence_100ms.wav", job_id]
 
     emotions = [e1, e2, e3, e4, e5, e6, e7, e8]
 
@@ -141,7 +143,6 @@ async def generate_audio(model_choice, text, language, speaker_audio, prefix_aud
         quadratic=quadratic, disable_torch_compile=disable_torch_compile
     )
     
-    uuid = params['seed']
     
     # Setup conditioning
     speaker_embedding = await setup_speaker_conditioning(
@@ -176,13 +177,16 @@ async def generate_audio(model_choice, text, language, speaker_audio, prefix_aud
     if IGNORE_PING == "pending":
         IGNORE_PING = True
         os.remove(output_wav_path)
-        return ["assets/silence_100ms.wav", uuid]
-    return [output_wav_path, uuid]
+        return ["assets/silence_100ms.wav", job_id]
+    
+    truct_path_str = str(Path(output_wav_path).relative_to(current_dir))
+    return [truct_path_str, job_id]
 
 def build_interface():
     output_temp = get_wavout_dir().parent.absolute()
     latents_dir = get_embed_cache_dir().parent.absolute()
-    speakers_dir = get_speakers_dir().parent.absolute()    
+    speakers_dir = get_speakers_dir().parent.absolute()
+
     gr.set_static_paths([output_temp, latents_dir, speakers_dir])
     """Build and return the Gradio interface"""
     supported_models = get_supported_models(ZONOS_BACKBONE, AI_MODEL_DIR_HY, AI_MODEL_DIR_TF)
