@@ -12,7 +12,10 @@ from utilities.cache_utils import (
     get_embed_cache_dir,
     get_speakers_dir
 )
+import warnings
 from zonos.speaker_cloning import SpeakerEmbeddingLDA
+from zonos.model import Zonos
+
 spk_clone_model = None
 spk_clone_model_device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -47,7 +50,9 @@ async def process_speaker_audio(speaker_audio_path: str, device: torch.device = 
         return cached_embedding
 
     try:
-        wav, sr = torchaudio.load(speaker_audio_path, normalize=True)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            wav, sr = torchaudio.load(speaker_audio_path, normalize=True)
         if wav.size(0) > 1:  # mix to mono
             wav = wav.mean(dim=0, keepdim=True)
     except Exception as e:
@@ -68,7 +73,7 @@ async def process_speaker_audio(speaker_audio_path: str, device: torch.device = 
     return speaker_embedding
 
 
-async def process_prefix_audio(prefix_audio_path: str, model, device: torch.device, enable_disk_cache=True) -> torch.Tensor:
+async def process_prefix_audio(prefix_audio_path: str, model: Zonos, device: torch.device, enable_disk_cache=True) -> torch.Tensor:
     """
     Process prefix audio and return encoded audio codes.
     Uses global caching to avoid recomputing codes for the same audio.
@@ -83,7 +88,9 @@ async def process_prefix_audio(prefix_audio_path: str, model, device: torch.devi
         return cached_codes
 
     logger.info("Encoding and caching new audio prefix.")
-    wav_prefix, sr_prefix = torchaudio.load(prefix_audio_path)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        wav_prefix, sr_prefix = torchaudio.load(prefix_audio_path)
     if wav_prefix.size(0) > 1:
         wav_prefix = wav_prefix.mean(dim=0, keepdim=True)
     wav_prefix = model.autoencoder.preprocess(wav_prefix, sr_prefix).unsqueeze(0)
