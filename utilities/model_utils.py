@@ -26,13 +26,16 @@ def load_model_if_needed(model_choice: str,
             torch.cuda.empty_cache()
 
         logger.info(f"Loading {model_choice} model...")
+        
+        # Convert device to string format (e.g., "cuda:0", "cuda:1", "cpu")
+        device_str = str(device)
 
         if is_online_model(model_choice, needed_models, debug_mode=False):
-            model = Zonos.from_pretrained(model_choice, device=device.type)
+            model = Zonos.from_pretrained(model_choice, device=device_str)
         else:
             config_path = f"{model_choice}{os.sep}config.json"
             model_path = f"{model_choice}{os.sep}model.safetensors"
-            model = Zonos.from_local(config_path, model_path, device=device.type)
+            model = Zonos.from_local(config_path, model_path, device=device_str)
 
         model.requires_grad_(False).eval()
 

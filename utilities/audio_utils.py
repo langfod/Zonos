@@ -19,6 +19,16 @@ from zonos.model import Zonos
 spk_clone_model = None
 spk_clone_model_device = "cuda" if torch.cuda.is_available() else "cpu"
 
+def set_device(device: torch.device) -> None:
+    """Set the device for speaker cloning model."""
+    global spk_clone_model_device, spk_clone_model
+    spk_clone_model_device = str(device)
+    # Reset the model so it gets recreated on the new device
+    if spk_clone_model is not None:
+        del spk_clone_model
+        spk_clone_model = None
+        torch.cuda.empty_cache()
+
 def make_speaker_embedding(wav: torch.Tensor, sr: int) -> torch.Tensor:
     global spk_clone_model
     if spk_clone_model is None:
