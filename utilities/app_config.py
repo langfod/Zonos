@@ -3,8 +3,8 @@ Application configuration management
 """
 import os
 from loguru import logger
-from sys import stdout, platform
-from typing import Dict, Set, Any, Tuple
+from sys import stdout
+from typing import Dict, Tuple
 
 from utilities.config_utils import update_model_paths_file, parse_model_paths_file
 from utilities.app_constants import ModelConfig

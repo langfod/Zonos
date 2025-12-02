@@ -22,6 +22,7 @@ from utilities.audio_generation_pipeline import (
     create_conditioning_dict, setup_prefix_audio,
     create_progress_callback, generate_and_save_audio
 )
+from utilities.audio_utils import set_device as set_audio_device
 from utilities.cache_utils import get_embed_cache_dir, get_wavout_dir, get_speakers_dir
 from utilities.file_utils import lcx_checkmodels
 from utilities.gradio_utils import update_ui_visibility  
@@ -35,6 +36,9 @@ from utilities.ui_components import (
 # Zonos-specific imports
 from zonos.model import DEFAULT_BACKBONE_CLS as ZONOS_BACKBONE
 from zonos.utilities.utils import DEFAULT_DEVICE
+
+# Configurable device - will be set from command line args
+DEVICE = DEFAULT_DEVICE
 
 # =============================================================================
 # APPLICATION SETUP
@@ -55,7 +59,6 @@ IGNORE_PING = None
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.benchmark = True  
 torch.set_float32_matmul_precision("medium")
-os.environ["GRADIO_TEMP_DIR"] = "temp_dir"
 # =============================================================================
 # COMMAND LINE ARGUMENT PARSING  
 # =============================================================================
@@ -66,6 +69,8 @@ def parse_arguments():
     parser.add_argument('--share', action='store_true')
     parser.add_argument("--server", type=str, default='0.0.0.0')
     parser.add_argument("--port", type=int, required=False)
+    parser.add_argument("--device", type=str, default=None, 
+                        help='CUDA device to use (e.g., "cuda:0", "cuda:1", "cpu"). Defaults to auto-detect.')
     parser.add_argument("--inbrowser", action='store_true')
     parser.add_argument("--output_dir", type=str, default='./outputs')
     parser.add_argument("--checkmodels", action='store_true')
@@ -76,6 +81,17 @@ def parse_arguments():
 
 def handle_cli_options(args, config):
     """Handle command line options that exit early"""
+    global DEVICE
+    
+    # Handle device selection
+    if args.device:
+        DEVICE = torch.device(args.device)
+        logger.info(f"Using device: {DEVICE}")
+        # Also set device for audio utilities (speaker cloning model)
+        set_audio_device(DEVICE)
+    else:
+        logger.info(f"Using default device: {DEVICE}")
+    
     if args.checkmodels:
         lcx_checkmodels(
             config.models.keys(), config.paths, config.models,
@@ -93,7 +109,7 @@ def handle_cli_options(args, config):
 
 def load_model_wrapper(model_choice: str, disable_torch_compile: bool = disable_torch_compile_default):
     """Wrapper for model loading"""
-    return load_model_if_needed(model_choice, DEFAULT_DEVICE, config.models.keys(), disable_torch_compile=disable_torch_compile)
+    return load_model_if_needed(model_choice, DEVICE, config.models.keys(), disable_torch_compile=disable_torch_compile)
 
 
 def update_ui(model_choice, disable_torch_compile):
@@ -146,11 +162,11 @@ async def generate_audio(model_choice, text, language, speaker_audio, prefix_aud
     
     # Setup conditioning
     speaker_embedding = await setup_speaker_conditioning(
-        speaker_audio, unconditional_keys, selected_model
+        speaker_audio, unconditional_keys, selected_model, device=DEVICE
     )
     
     cond_dict = create_conditioning_dict(
-        text, language, speaker_embedding, emotions, params, unconditional_keys
+        text, language, speaker_embedding, emotions, params, unconditional_keys, device=DEVICE
     )
     
     conditioning = selected_model.prepare_conditioning(
@@ -158,7 +174,7 @@ async def generate_audio(model_choice, text, language, speaker_audio, prefix_aud
     )
     
     # Setup prefix audio
-    audio_prefix_codes = await setup_prefix_audio(prefix_audio, selected_model)
+    audio_prefix_codes = await setup_prefix_audio(prefix_audio, selected_model, device=DEVICE)
     
     # Setup progress callback
     callback = create_progress_callback(do_progress, text, progress)
@@ -179,8 +195,7 @@ async def generate_audio(model_choice, text, language, speaker_audio, prefix_aud
         os.remove(output_wav_path)
         return ["assets/silence_100ms.wav", job_id]
     
-    truct_path_str = str(Path(output_wav_path).relative_to(current_dir))
-    return [truct_path_str, job_id]
+    return [output_wav_path, job_id]
 
 def build_interface():
     output_temp = get_wavout_dir().parent.absolute()
@@ -254,7 +269,15 @@ if __name__ == "__main__":
     handle_cli_options(args, config)
     
     # Set up Gradio static paths and preload model
+    output_temp = get_wavout_dir().parent.absolute()
+    latents_dir = get_embed_cache_dir().parent.absolute()
+    speakers_dir = get_speakers_dir().parent.absolute()
+    gradio_temp ="temp_dir"
+    os.environ["GRADIO_TEMP_DIR"] = gradio_temp
+
+    os.environ["GRADIO_ALLOWED_PATHS"] = f'"assets","{gradio_temp}","{output_temp}","{latents_dir}","{speakers_dir}"' 
     gr.set_static_paths(paths=["assets/"])
+
     default_model = "Zyphra/Zonos-v0.1-transformer"
     model = load_model_wrapper(default_model)
 

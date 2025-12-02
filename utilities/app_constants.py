@@ -19,7 +19,7 @@ class UIConfig:
     
     # Slider ranges and defaults
     DNSMOS_RANGE = (1.0, 5.0, 4.0, 0.1)
-    FMAX_RANGE = (0, 24000, 24000, 1)
+    FMAX_RANGE = (0, 24000, 22050, 1)
     VQ_SCORE_RANGE = (0.5, 0.8, 0.78, 0.01)
     PITCH_STD_RANGE = (0.0, 300.0, 45.0, 1)
     SPEAKING_RATE_RANGE = (5.0, 30.0, 15.0, 0.5)

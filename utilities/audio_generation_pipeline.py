@@ -75,22 +75,28 @@ def prepare_generation_params(text: str, seed: int, randomize_seed: bool,
     return params
 
 
-async def setup_speaker_conditioning(speaker_audio: Optional[str], unconditional_keys: list, model, enable_disk_cache: bool = True) -> Optional[Any]:
+async def setup_speaker_conditioning(speaker_audio: Optional[str], unconditional_keys: list, model, enable_disk_cache: bool = True, device: torch.device = None) -> Optional[Any]:
     """Process speaker audio for conditioning"""
     if speaker_audio is None or "speaker" in unconditional_keys:
         return None
     
+    if device is None:
+        device = DEFAULT_DEVICE
+    
     with PerformanceTimer("speaker_embedding"):
         return await process_speaker_audio(
             speaker_audio_path=speaker_audio, 
-            device=DEFAULT_DEVICE,
+            device=device,
             enable_disk_cache=enable_disk_cache
         )
 
 
 def create_conditioning_dict(text: str, language: str, speaker_embedding: Optional[Any],
-                           emotions: list, params: Dict[str, Any], unconditional_keys: list) -> Dict[str, Any]:
+                           emotions: list, params: Dict[str, Any], unconditional_keys: list, device: torch.device = None) -> Dict[str, Any]:
     """Create the conditioning dictionary for generation"""
+    if device is None:
+        device = DEFAULT_DEVICE
+    
     vq_val = [params['vq_single']] * 8 if 'vq_single' in params else None
     
     return make_cond_dict(
@@ -104,19 +110,23 @@ def create_conditioning_dict(text: str, language: str, speaker_embedding: Option
         speaking_rate=params['speaking_rate'],
         dnsmos_ovrl=params['dnsmos_ovrl'], 
         speaker_noised=params['speaker_noised'], 
-        device=DEFAULT_DEVICE,
+        device=device,
         unconditional_keys=unconditional_keys
     )
 
 
-async def setup_prefix_audio(prefix_audio: Optional[str], model) -> Optional[Any]:
+async def setup_prefix_audio(prefix_audio: Optional[str], model, device: torch.device = None) -> Optional[Any]:
     """Process prefix audio if provided"""
     if prefix_audio is None:
         return None
+    
+    if device is None:
+        device = DEFAULT_DEVICE
+    
     return await process_prefix_audio(
         prefix_audio_path=prefix_audio, 
         model=model, 
-        device=DEFAULT_DEVICE
+        device=device
     )
 
 
